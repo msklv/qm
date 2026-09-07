@@ -6,6 +6,10 @@ on:
       - "**"
   workflow_dispatch:
 
+concurrency:
+  group: branch-images-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   packages: write
@@ -14,6 +18,7 @@ jobs:
   image:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -42,7 +47,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - name: Derive branch tag
-        run: echo "BRANCH_TAG=${GITHUB_REF_NAME//[^a-zA-Z0-9_.-]/-}" >> "$GITHUB_ENV"
+        run: |
+          tag=$(printf '%s' "${GITHUB_REF_NAME,,}" | sed -E 's/[^a-z0-9_.-]/-/g; s/^-+|-+$//g' | cut -c1-60)
+          [ -z "$tag" ] && tag="${GITHUB_SHA:0:12}"
+          [ "$tag" = latest ] && tag="latest-branch"
+          echo "BRANCH_TAG=$tag" >> "$GITHUB_ENV"
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: .
