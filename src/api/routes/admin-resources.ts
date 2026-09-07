@@ -1,3 +1,4 @@
+import { parseAckEmoji } from "../../slack/config.ts";
 import { orgId as configOrgId } from "../../config.ts";
 import type { ServerDeps } from "../deps.ts";
 import type { ApiCtx } from "./route.ts";
@@ -13,9 +14,10 @@ import {
   resolveModel,
   SELECTABLE_BASE_MODELS,
   ALL_PROVIDERS_AVAILABLE,
+  type HarnessId,
 } from "../../model/pi-models.ts";
 import { resolveRuntimeChoiceDurable } from "../../harness/harness-router.ts";
-import { type OrgBranding } from "../../resolution/config-store.ts";
+import { sanitizeBranding } from "../../resolution/branding.ts";
 import {
   isValidCredentialSlug,
   isValidServiceCredentialEnvKey,
@@ -30,10 +32,64 @@ import { resolverFor } from "./connectors.ts";
 import { encodeRef, serviceCredRef } from "../../acl/resource-ref.ts";
 import { audit } from "./shared.ts";
 import { errMessage } from "../../util/errors.ts";
-import { parseSecurityPosture, SECURITY_POSTURES, type SecurityPosture } from "../../security/security-posture.ts";
+import {
+  DEFAULT_SECURITY_SCREEN_RUBRIC,
+  parseSecurityPosture,
+  SECURITY_POSTURES,
+  type SecurityPosture,
+} from "../../security/security-posture.ts";
 import type { ApprovalGrantModes } from "../../types.ts";
 import { parseEgressPolicy } from "../../resolution/egress-policy.ts";
 import { DEVICE_FLOW_CUTOVER_MODES, type DeviceFlowCutoverMode } from "../../credentials/device-flow-cutover.ts";
+
+export interface AutoFlaggerDraft {
+  harnessId: HarnessId;
+  modelId: string;
+  rubric: string;
+}
+
+const AUTO_FLAGGER_MAX_RUBRIC_CHARS = 20_000;
+
+/** The flagger a deployment falls back to when nothing is configured. */
+export function defaultAutoFlaggerConfig(deps: Pick<ServerDeps, "harnessId" | "baseModelDefault">): AutoFlaggerDraft {
+  const harnessId = (isHarnessId(deps.harnessId ?? "") ? deps.harnessId : "pi") as HarnessId;
+  return {
+    harnessId,
+    modelId: defaultModelForHarness(harnessId, deps.baseModelDefault),
+    rubric: DEFAULT_SECURITY_SCREEN_RUBRIC,
+  };
+}
+
+/**
+ * Validate an Auto flagger configuration — shared by the governance save and the test run, so a
+ * rubric that tests cleanly is exactly the one that can be applied.
+ */
+export async function parseAutoFlaggerDraft(
+  deps: Pick<ServerDeps, "providerKeys" | "modelCredentials">,
+  body: { harnessId?: unknown; modelId?: unknown; rubric?: unknown },
+): Promise<{ value: AutoFlaggerDraft } | { error: string }> {
+  if (typeof body.harnessId !== "string" || !isHarnessId(body.harnessId) || body.harnessId === "mock") {
+    return { error: "auto-flagger requires a valid harnessId" };
+  }
+  if (typeof body.modelId !== "string" || !body.modelId.trim()) {
+    return { error: "auto-flagger requires a modelId" };
+  }
+  const modelId = body.modelId.trim();
+  if (!modelSupportedByHarness(modelId, body.harnessId)) {
+    return { error: `model ${modelId} is not supported by ${body.harnessId}` };
+  }
+  if (typeof body.rubric !== "string" || !body.rubric.trim() || body.rubric.length > AUTO_FLAGGER_MAX_RUBRIC_CHARS) {
+    return {
+      error: `auto-flagger requires a non-empty rubric of at most ${AUTO_FLAGGER_MAX_RUBRIC_CHARS} characters`,
+    };
+  }
+  const configuredKeys = deps.providerKeys ?? ALL_PROVIDERS_AVAILABLE;
+  const managedKeys = deps.modelCredentials ? await deps.modelCredentials.availability() : configuredKeys;
+  if (!modelServiceable(modelId, modelProviderAvailabilityFor(body.harnessId, configuredKeys, managedKeys))) {
+    return { error: `model ${modelId} isn't serviceable on this deployment` };
+  }
+  return { value: { harnessId: body.harnessId, modelId, rubric: body.rubric.trim() } };
+}
 
 type Actor = { id: string };
 
@@ -104,6 +160,28 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
       },
       (deps, scope, posture) => deps.config!.setSecurityPosture(scope, posture),
     ),
+  },
+  {
+    id: "auto-flagger",
+    kind: "custom",
+    target: "org",
+    clearable: true,
+    label: "The model and classification rubric used to screen external content while Auto posture is active.",
+    readKey: "autoFlagger",
+    get: (deps) => deps.config!.getAutoFlaggerConfig(),
+    apply: async (ctx, _actor, scope) => {
+      const bad = orgOnly(scope, "the Auto flagger is org-wide");
+      if (bad) return bad;
+      const body = ctx.body as { reset?: unknown };
+      if (body.reset === true) {
+        ctx.deps.config!.setAutoFlaggerConfig(null);
+        return { ok: true };
+      }
+      const parsed = await parseAutoFlaggerDraft(ctx.deps, ctx.body as Record<string, unknown>);
+      if ("error" in parsed) return parsed;
+      ctx.deps.config!.setAutoFlaggerConfig(parsed.value);
+      return { ok: true };
+    },
   },
   {
     id: "approval-grant-modes",
@@ -361,6 +439,23 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
     ),
   },
   {
+    id: "individual-model-auth",
+    kind: "boolean",
+    target: "org",
+    label:
+      "Individual authorization for AI usage org-wide: on means each user must connect their own Claude or Codex account (API key or subscription login) before using the assistant; the org's shared model credentials are not used for their turns.",
+    readKey: "individualModelAuth",
+    get: (deps, scope) => (parseScopeId(scope).kind === "org" ? deps.config!.getIndividualModelAuth() : undefined),
+    apply: generic<boolean>(
+      (body, { scope }) => {
+        const bad = orgOnly(scope, "the individual-authorization switch is org-wide");
+        if (bad) return bad;
+        return boolBody(body);
+      },
+      (deps, _scope, on) => deps.config!.setIndividualModelAuth(on),
+    ),
+  },
+  {
     id: "base-model",
     kind: "enum",
     target: "any",
@@ -506,6 +601,34 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
     ),
   },
   {
+    id: "ack-emoji",
+    kind: "string-list",
+    target: "org",
+    clearable: true,
+    label:
+      "Slack ack emoji (names the bot may react with to acknowledge a message). Empty restores the built-in rotation.",
+    readKey: "ackEmoji",
+    get: (deps, scope) => deps.config!.getAckEmoji(scope),
+    apply: generic<string[] | null>(
+      (body, { scope }) => {
+        const bad = orgOnly(scope, "the ack emoji set is org-wide");
+        if (bad) return bad;
+        const raw = (body as { names?: unknown }).names;
+        if (raw !== undefined && raw !== null && !Array.isArray(raw)) {
+          return { error: "ack-emoji requires { names: string[] } (empty list restores the default rotation)" };
+        }
+        const input = Array.isArray(raw) ? raw.map((v) => (typeof v === "string" ? v : "")).join(",") : "";
+        const names = parseAckEmoji(input);
+        const supplied = Array.isArray(raw) ? raw.filter((v) => typeof v === "string" && v.trim()).length : 0;
+        if (supplied && names.length !== supplied) {
+          return { error: "ack-emoji names must be Slack emoji names (lowercase letters, digits, _ + -)" };
+        }
+        return { value: names.length ? names : null };
+      },
+      (deps, scope, names) => deps.config!.setAckEmoji(scope, names),
+    ),
+  },
+  {
     id: "branding",
     kind: "custom",
     target: "org",
@@ -515,23 +638,13 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
     apply: async (ctx, _actor, scope) => {
       const bad = orgOnly(scope, "branding is org-wide");
       if (bad) return bad;
-      const body = (ctx.body ?? {}) as { accent?: unknown; mark?: unknown; selfLabel?: unknown };
-      const clean = (v: unknown): string =>
-        (typeof v === "string" ? v : "").replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029<>]/g, "").trim();
-      const accent = clean(body.accent);
-      if (accent && !/^#([0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(accent)) {
+      const body = (ctx.body ?? {}) as { accent?: unknown; mark?: unknown; selfLabel?: unknown; orgName?: unknown };
+      const accentInput = typeof body.accent === "string" ? body.accent.trim() : "";
+      const value = sanitizeBranding(body);
+      if (accentInput && !value?.accent) {
         return { error: "branding accent must be a hex color (e.g. #4f46e5)" };
       }
-      const mark = clean(body.mark)
-        .replace(/["\\{}]/g, "")
-        .slice(0, 2);
-      const selfLabel = clean(body.selfLabel).slice(0, 40);
-      const value: OrgBranding = {
-        ...(accent ? { accent } : {}),
-        ...(mark ? { mark } : {}),
-        ...(selfLabel ? { selfLabel } : {}),
-      };
-      ctx.deps.config!.setBranding(scope, Object.keys(value).length ? value : null);
+      ctx.deps.config!.setBranding(scope, value ?? null);
       return { ok: true };
     },
   },
@@ -903,12 +1016,6 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
       });
       if (badGrantee !== undefined)
         return { error: `grantee must be this org or a valid personal:/team: scope (got ${badGrantee})` };
-      if (delivery === "env" && desired?.some((g) => g !== scope)) {
-        return {
-          error:
-            "env-delivery credentials are injected into every all-internal conversation — person/team grants don't gate them; share org-wide",
-        };
-      }
       const injection =
         b.injection && typeof b.injection === "object"
           ? ({

@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { pathToFileURL } from "node:url";
+import { ADMIN_LOGIN_SCRIPT, ADMIN_LOGIN_SCRIPT_HASH, openAdminLogin } from "./admin-login.ts";
 import { LRUCache } from "lru-cache";
 import {
   deriveKey,
@@ -35,12 +36,14 @@ import {
   FORWARD_DEPLOYMENT_LAYER_HEADERS,
   FORWARD_OAUTH_HEADERS,
   FORWARD_BROKER_HEADERS,
+  FORWARD_WEBHOOK_HEADERS,
 } from "./proxy.ts";
 import { signedHeaders, withSourceAuthNonce } from "../../chassis/src/core-client.ts";
-import { coreClaimStore, withinRateLimit } from "../../chassis/src/claims.ts";
+import { coreClaimStore, claimOnce, withinRateLimit, ClaimStoreUnavailableError } from "../../chassis/src/claims.ts";
+import { coreEmailAllowed } from "../../chassis/src/external-members.ts";
 import { mintPortalIdentity, PORTAL_IDENTITY_HEADER } from "../../chassis/src/portal-identity.ts";
 import { errMessage } from "../../chassis/src/errors.ts";
-import { json, escapeHtml, serveEmojiFavicon } from "../../chassis/src/http.ts";
+import { json, escapeHtml, serveEmojiFavicon, readBody, PayloadTooLargeError } from "../../chassis/src/http.ts";
 import {
   CORE_API_URL as CORE,
   CORE_ORG_ID as ORG,
@@ -55,8 +58,10 @@ const SESSION_SECRET = process.env.PORTAL_SESSION_SECRET;
 const SESSION_TTL_S = Number(process.env.PORTAL_SESSION_TTL_S ?? 28800);
 const SESSION_MAX_TTL_S = Number(process.env.PORTAL_SESSION_MAX_TTL_S ?? Math.max(86400, SESSION_TTL_S));
 const SESSION_RENEW_AFTER_S = Math.floor(SESSION_TTL_S / 2);
-const COOKIE_DOMAIN = process.env.PORTAL_COOKIE_DOMAIN || undefined;
-const APPS_DOMAIN = process.env.PORTAL_APPS_DOMAIN || undefined;
+const APPS_DOMAIN = process.env.PORTAL_APPS_DOMAIN || process.env.DEPLOY_APPS_DOMAIN || undefined;
+const COOKIE_DOMAIN =
+  process.env.PORTAL_COOKIE_DOMAIN ||
+  (APPS_DOMAIN ? derivedCookieDomain(hostOf(process.env.PORTAL_PUBLIC_URL ?? ""), APPS_DOMAIN) : undefined);
 const IS_PROD = process.env.NODE_ENV === "production";
 const SECURE_COOKIES = PUBLIC_URL.startsWith("https://");
 const ORIGIN = (() => {
@@ -69,8 +74,10 @@ const ORIGIN = (() => {
 const LOCAL_AUTH_BYPASS_REQUESTED = process.env.PORTAL_LOCAL_AUTH_BYPASS === "1";
 const LOCAL_AUTH_BYPASS = LOCAL_AUTH_BYPASS_REQUESTED && !IS_PROD && isLocalPortalUrl(PUBLIC_URL);
 const LOCAL_AUTH_PRINCIPAL = process.env.PORTAL_DEV_PRINCIPAL || process.env.USER || "dev-admin";
-const DEPLOYMENTS_ENABLED = process.env.PORTAL_DEPLOYMENTS_ENABLED === "1";
 const PLAYGROUND = process.env.PORTAL_PLAYGROUND === "1";
+const DEPLOYMENTS_ENABLED = process.env.PORTAL_DEPLOYMENTS_ENABLED
+  ? process.env.PORTAL_DEPLOYMENTS_ENABLED === "1"
+  : !PLAYGROUND;
 function playgroundIntEnv(name: string, fallback: number): number {
   const raw = process.env[name]?.trim();
   if (!raw) return fallback;
@@ -201,8 +208,9 @@ export function consumeState(state: string): boolean {
 }
 
 const ADMIN_TTL_MS = 60_000;
-const ADMIN_PROBE_TIMEOUT_MS = 1500;
+const ADMIN_PROBE_TIMEOUT_MS = 6_500;
 const ADMIN_PROBE_ATTEMPTS = 2;
+const ADMIN_PROBE_RETRY_DELAY_MS = 250;
 const adminCache = new LRUCache<string, boolean>({ max: 10_000, ttl: ADMIN_TTL_MS });
 
 async function adminProbeAttempt(sub: string): Promise<boolean | null> {
@@ -217,10 +225,18 @@ async function adminProbeAttempt(sub: string): Promise<boolean | null> {
       );
     }
     const r = await fetch(`${UPSTREAMS.admin}/api/whoami`, { headers, signal: ctrl.signal });
-    if (!r.ok) return null;
-    const j = (await r.json()) as { isAdmin?: boolean };
-    return j.isAdmin === true;
-  } catch {
+    if (!r.ok) {
+      console.warn(`[portal] admin probe returned HTTP ${r.status}`);
+      return null;
+    }
+    const j = (await r.json()) as { isAdmin?: unknown };
+    if (typeof j.isAdmin !== "boolean") {
+      console.warn("[portal] admin probe returned an invalid admin status");
+      return null;
+    }
+    return j.isAdmin;
+  } catch (error) {
+    console.warn(`[portal] admin probe failed: ${errMessage(error)}`);
     return null;
   } finally {
     clearTimeout(timer);
@@ -232,7 +248,11 @@ async function adminProbe(sub: string): Promise<{ isAdmin: boolean; failed: bool
   if (hit !== undefined) return { isAdmin: hit, failed: false };
   for (let attempt = 0; attempt < ADMIN_PROBE_ATTEMPTS; attempt++) {
     const isAdmin = await adminProbeAttempt(sub);
-    if (isAdmin === null) continue;
+    if (isAdmin === null) {
+      if (attempt + 1 < ADMIN_PROBE_ATTEMPTS)
+        await new Promise((resolve) => setTimeout(resolve, ADMIN_PROBE_RETRY_DELAY_MS));
+      continue;
+    }
     adminCache.set(sub, isAdmin);
     return { isAdmin, failed: false };
   }
@@ -246,10 +266,10 @@ async function isAdmin(sub: string): Promise<boolean> {
 const PAGE_CSP =
   "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
-function sendHtml(res: ServerResponse, status: number, html: string): void {
+function sendHtml(res: ServerResponse, status: number, html: string, csp = PAGE_CSP): void {
   res.writeHead(status, {
     "content-type": "text/html; charset=utf-8",
-    "content-security-policy": PAGE_CSP,
+    "content-security-policy": csp,
     "x-content-type-options": "nosniff",
     "cache-control": "no-store",
   });
@@ -283,6 +303,11 @@ function hostOf(raw: string): string {
   } catch {
     return "";
   }
+}
+
+export function derivedCookieDomain(portalHost: string, appsDomain: string): string | undefined {
+  const host = portalHost.toLowerCase();
+  return host.includes(".") && appsDomain.toLowerCase().endsWith(`.${host}`) ? host : undefined;
 }
 
 export function hostIsWithinDomain(host: string, domain: string): boolean {
@@ -790,6 +815,9 @@ async function mintPlaygroundSession(req: IncomingMessage, res: ServerResponse):
     limit: PLAYGROUND_MINTS_PER_IP,
     windowS: PLAYGROUND_MINT_WINDOW_S,
     nowMs: Date.now(),
+  }).catch((e) => {
+    if (e instanceof ClaimStoreUnavailableError) return false;
+    throw e;
   });
   if (!allowed) return null;
   const now = Math.floor(Date.now() / 1000);
@@ -857,6 +885,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
   if (pathname === "/auth/login" && method === "GET") return authLogin(req, res, url);
   if (pathname === "/auth/callback" && method === "GET") return authCallback(req, res, url);
+  if (pathname === "/auth/admin-login") return adminLogin(req, res);
   if (pathname === "/auth/logout" && method === "POST") {
     if (!sameOriginRequest(req)) return json(res, 403, { error: "forbidden" });
     setSession(res, [
@@ -939,6 +968,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const rawPath = rawTarget.split("?")[0] ?? "";
   if (/%2f|%5c|%2e%2e|\\|\x00/i.test(rawPath) || rawPath.includes("//") || pathname.includes("/..")) {
     return json(res, 400, { error: "bad_request", message: "illegal path" });
+  }
+
+  if (method === "POST" && /^\/v1\/webhooks\/incoming\/[^/]+$/.test(pathname)) {
+    return proxyToUpstream(req, res, { baseUrl: CORE, path: pathname, search: url.search }, FORWARD_WEBHOOK_HEADERS);
   }
 
   const consentBounce = (): void => {
@@ -1037,6 +1070,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   if (isDeployment) {
+    if (session.anon) return json(res, 403, { error: "forbidden", message: "sign in to view deployed apps" });
     const rest = pathname.slice(`/${seg}/`.length);
     const slash = rest.indexOf("/");
     const id = decodeURIComponent(slash === -1 ? rest : rest.slice(0, slash));
@@ -1104,6 +1138,79 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   });
 }
 
+async function adminLogin(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (!SESSION_SECRET || SESSION_SECRET.trim().length < 32 || !CORE_SIGNING_SECRET) {
+    return json(res, 503, { error: "not_configured" });
+  }
+  if (req.method === "GET") {
+    return sendHtml(
+      res,
+      200,
+      cardPage({
+        title: "Admin sign-in",
+        heading: "Sign in as an administrator",
+        msg: "Only continue if you generated this link for your own admin account.",
+        icon: LOCK_ICON,
+        extra: '<p id="admin-email"></p><noscript>JavaScript is required to open this login link.</noscript>',
+        actions: `<form method="post" action="/auth/admin-login"><input id="admin-token" name="token" type="hidden"><button id="admin-confirm" class="btn primary" style="width:100%" type="submit" disabled>Sign in</button></form><script>${ADMIN_LOGIN_SCRIPT}</script>`,
+        help: "This link expires after five minutes and can be used once. Generate another with qm admin-login.",
+      }),
+      `${PAGE_CSP}; script-src '${ADMIN_LOGIN_SCRIPT_HASH}'`,
+    );
+  }
+  if (req.method !== "POST") return json(res, 405, { error: "method_not_allowed" });
+  if (!sameOriginRequest(req)) return json(res, 403, { error: "forbidden" });
+  let token: string;
+  try {
+    token = new URLSearchParams(await readBody(req, 8192)).get("token") ?? "";
+  } catch (error) {
+    if (error instanceof PayloadTooLargeError) return json(res, 413, { error: "payload_too_large" });
+    throw error;
+  }
+  const claims = openAdminLogin(token, SESSION_SECRET, ORIGIN);
+  const fail = () =>
+    sendHtml(
+      res,
+      400,
+      signInErrorHtml("This admin link is invalid, expired, or already used. Generate a new link with qm admin-login."),
+    );
+  if (!claims) return fail();
+  const allowed = await adminProbeAttempt(claims.email);
+  if (allowed === null)
+    return sendHtml(res, 503, signInErrorHtml("Admin access could not be checked. Please try again."));
+  if (!allowed) return sendHtml(res, 403, signInErrorHtml("This account does not have admin access."));
+  try {
+    const claimsStore = coreClaimStore(CORE, CORE_SIGNING_SECRET, "portal");
+    if (!(await claimOnce(claimsStore, `admin-login:${claims.jti}`, claims.expiresAtMs))) return fail();
+  } catch (error) {
+    if (error instanceof ClaimStoreUnavailableError) {
+      return sendHtml(res, 503, signInErrorHtml("Sign-in is temporarily unavailable. Please try again."));
+    }
+    throw error;
+  }
+  setAuthenticatedSession(res, claims.email);
+  res.writeHead(303, { location: "/admin/", "cache-control": "no-store" });
+  res.end();
+}
+
+function setAuthenticatedSession(res: ServerResponse, sub: string, name = ""): void {
+  const now = Math.floor(Date.now() / 1000);
+  const session: SessionClaims = {
+    k: "session",
+    sub,
+    org: ORG,
+    auth: now,
+    iat: now,
+    exp: now + SESSION_TTL_S,
+    ...(name ? { name } : {}),
+  };
+  setSession(res, [
+    ...sessionCookieSet(seal(session, sessionKey)),
+    clearCookie("portal_oidc_tmp", "/auth", SECURE_COOKIES),
+    clearCookie("portal_impersonate", "/", SECURE_COOKIES),
+  ]);
+}
+
 function authLogin(req: IncomingMessage, res: ServerResponse, url: URL): void {
   const returnTo = sanitizeReturnTo(url.searchParams.get("returnTo"), PUBLIC_URL, APPS_DOMAIN);
   const localSession = localDevSession(req, Date.now(), true);
@@ -1156,27 +1263,16 @@ async function authCallback(req: IncomingMessage, res: ServerResponse, url: URL)
     const infoSub = typeof info.sub === "string" ? info.sub : "";
     if (!infoSub) throw new Error("userinfo missing sub");
     if (typeof claims.sub === "string" && claims.sub !== infoSub) throw new Error("subject mismatch");
-    sub = resolvePrincipal(PRINCIPAL_RULE, { sub: infoSub, claims, userinfo: info });
+    sub = await resolvePrincipal(PRINCIPAL_RULE, { sub: infoSub, claims, userinfo: info }, (email) =>
+      coreEmailAllowed(CORE, CORE_SIGNING_SECRET, email, "portal"),
+    );
     const rawName = info.name ?? claims.name;
     if (typeof rawName === "string") name = rawName.trim().slice(0, 200);
   } catch (e) {
     return fail(errMessage(e, "sign-in failed"));
   }
 
-  const now = Math.floor(Date.now() / 1000);
-  const session: SessionClaims = {
-    k: "session",
-    sub,
-    org: ORG,
-    auth: now,
-    iat: now,
-    exp: now + SESSION_TTL_S,
-    ...(name ? { name } : {}),
-  };
-  setSession(res, [
-    ...sessionCookieSet(seal(session, sessionKey)),
-    clearCookie("portal_oidc_tmp", "/auth", SECURE_COOKIES),
-  ]);
+  setAuthenticatedSession(res, sub, name);
   res.writeHead(302, {
     location: sanitizeReturnTo(tmp.returnTo, PUBLIC_URL, APPS_DOMAIN),
     "cache-control": "no-store",
@@ -1186,6 +1282,11 @@ async function authCallback(req: IncomingMessage, res: ServerResponse, url: URL)
 
 export function bootChecks(): void {
   const problems: string[] = [];
+  if (!AUTH_BROKER_UPSTREAM && originOf(OIDC.authEndpoint) && originOf(OIDC.authEndpoint) === originOf(PUBLIC_URL)) {
+    problems.push(
+      "OIDC_AUTH_ENDPOINT is on the portal's own origin but AUTH_BROKER_UPSTREAM is unset — every sign-in would redirect from /auth/login back into the portal forever; wire AUTH_BROKER_UPSTREAM to the auth service or point OIDC_AUTH_ENDPOINT at a real identity provider",
+    );
+  }
   if (LOCAL_AUTH_BYPASS_REQUESTED && IS_PROD) {
     problems.push("PORTAL_LOCAL_AUTH_BYPASS may not be enabled in production");
   }
@@ -1209,7 +1310,7 @@ export function bootChecks(): void {
     }
     if (COOKIE_DOMAIN || APPS_DOMAIN) {
       problems.push(
-        "PORTAL_PLAYGROUND requires PORTAL_COOKIE_DOMAIN and PORTAL_APPS_DOMAIN unset — a domain-wide cookie would carry anonymous sessions to app subdomains, which never see the anon flag",
+        "PORTAL_PLAYGROUND requires PORTAL_COOKIE_DOMAIN and the apps domain (PORTAL_APPS_DOMAIN / DEPLOY_APPS_DOMAIN) unset — a domain-wide cookie would carry anonymous sessions to app subdomains, which never see the anon flag",
       );
     }
     if (DEPLOYMENTS_ENABLED) {
@@ -1220,7 +1321,7 @@ export function bootChecks(): void {
   }
   if (APPS_DOMAIN && !COOKIE_DOMAIN) {
     problems.push(
-      "PORTAL_APPS_DOMAIN requires PORTAL_COOKIE_DOMAIN (app returnTo without a domain-wide session cookie loops sign-in forever)",
+      `the apps domain (${APPS_DOMAIN}) is not a subdomain of the portal host, so the cookie domain cannot be derived — set PORTAL_COOKIE_DOMAIN to the parent domain covering both (app returnTo without a domain-wide session cookie loops sign-in forever)`,
     );
   }
   if (COOKIE_DOMAIN && !hostIsWithinDomain(hostOf(PUBLIC_URL), COOKIE_DOMAIN)) {

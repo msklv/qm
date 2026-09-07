@@ -112,6 +112,26 @@ test("publicUrl must be an http(s) origin URL on every target", () => {
   }
 });
 
+test("botName and orgName are optional trimmed strings with length caps", () => {
+  withConfig({}, ({ path }) => {
+    const { config } = loadConfigAt(path);
+    assert.equal(config.botName, undefined);
+    assert.equal(config.orgName, undefined);
+  });
+  withConfig({ botName: " straylight ", orgName: " Acme Corp " }, ({ path }) => {
+    const { config } = loadConfigAt(path);
+    assert.equal(config.botName, "straylight");
+    assert.equal(config.orgName, "Acme Corp");
+  });
+  withConfig({ botName: "x".repeat(31) }, ({ path }) => assert.equal(loadConfigAt(path).config.botName?.length, 31));
+  for (const botName of ["", "   ", 7, "x".repeat(32), "{{bot}}", "a<b>c", "bot\nX", 'a"b', "a\\b"]) {
+    withConfig({ botName }, ({ path }) => assert.throws(() => loadConfigAt(path), /"botName" must be/));
+  }
+  for (const orgName of ["", 7, "x".repeat(41), "Acme {{Corp}}"]) {
+    withConfig({ orgName }, ({ path }) => assert.throws(() => loadConfigAt(path), /"orgName" must be/));
+  }
+});
+
 test("basePort must be a positive integer", () => {
   withConfig({ basePort: 9000 }, ({ path }) => assert.equal(loadConfigAt(path).config.basePort, 9000));
   withConfig({ basePort: -1 }, ({ path }) => assert.throws(() => loadConfigAt(path), /basePort/));
@@ -838,8 +858,14 @@ test("sandbox shape errors: object, app non-empty string, env string-map, secret
     { sandbox: { env: { "1BAD": "x" } }, rx: /"sandbox.env" key .* is not a valid env var name/ },
     { sandbox: { secretEnv: "X" }, rx: /"sandbox.secretEnv" must be an array of strings/ },
     { sandbox: { secretEnv: ["1BAD"] }, rx: /not a valid env var name/ },
-    { sandbox: { backend: "k8s", app: "acme-sandboxes" }, rx: /"sandbox.backend" must be "sprites".*or "aws"/ },
-    { sandbox: { backend: "fly", app: "acme-sandboxes" }, rx: /"sandbox.backend" must be "sprites".*or "aws"/ },
+    {
+      sandbox: { backend: "k8s", app: "acme-sandboxes" },
+      rx: /"sandbox.backend" must be "local".*"sprites".*"aws".*or "agent37"/,
+    },
+    {
+      sandbox: { backend: "fly", app: "acme-sandboxes" },
+      rx: /"sandbox.backend" must be "local".*"sprites".*"aws".*or "agent37"/,
+    },
     { sandbox: { backend: "sprites" }, rx: /"sandbox.backend": "sprites" requires "sandbox.app"/ },
     {
       sandbox: { backend: "aws", app: "acme-sandboxes" },
@@ -851,6 +877,42 @@ test("sandbox shape errors: object, app non-empty string, env string-map, secret
       assert.throws(() => loadConfigAt(path), rx, `expected ${JSON.stringify(sandbox)} rejected`),
     );
   }
+});
+
+test("docker accepts an explicit local sandbox image without Fly coordinates", () => {
+  withConfig({ sandbox: { backend: "local", image: "qm-sandbox-local:latest" } }, ({ path }) => {
+    const { config } = loadConfigAt(path);
+    assert.deepEqual(sandboxCoreEnv(config), {
+      env: { SANDBOX_BACKEND: "local", LOCAL_SANDBOX_IMAGE: "qm-sandbox-local:latest" },
+      missingSecrets: [],
+    });
+    assert.equal(sandboxPinPending(config), false);
+    assert.deepEqual(sandboxImagePinErrors(config), []);
+  });
+});
+
+test("local sandbox config is docker-only and rejects unused Fly settings", () => {
+  withConfig({ target: "fly", sandbox: { backend: "local" } }, ({ path }) => {
+    assert.throws(() => loadConfigAt(path), /"sandbox.backend": "local" requires target "docker"/);
+  });
+  withConfig({ sandbox: { backend: "local", app: "acme-sandboxes" } }, ({ path }) => {
+    assert.throws(() => loadConfigAt(path), /"sandbox.backend": "local" ignores "sandbox.app"/);
+  });
+});
+
+test("agent37 is a deployment backend on every target and rejects unused Fly settings", () => {
+  for (const target of ["docker", "fly"] as const) {
+    withConfig({ target, sandbox: { backend: "agent37" } }, ({ path }) => {
+      const { config } = loadConfigAt(path);
+      assert.deepEqual(sandboxCoreEnv(config), {
+        env: { SANDBOX_BACKEND: "agent37" },
+        missingSecrets: [],
+      });
+    });
+  }
+  withConfig({ sandbox: { backend: "agent37", app: "unused" } }, ({ path }) => {
+    assert.throws(() => loadConfigAt(path), /"sandbox.backend": "agent37" ignores "sandbox.app"/);
+  });
 });
 
 test("aws target makes the sandbox substrate explicit: backend required with a sandbox block, sprites needs app, aws forbids fly-image settings", () => {
@@ -872,6 +934,11 @@ test("aws target makes the sandbox substrate explicit: backend required with a s
   });
   withConfig({ target: "aws", aws, sandbox: { backend: "aws" } }, ({ path }) => {
     assert.equal(loadConfigAt(path).config.sandbox?.backend, "aws");
+  });
+  withConfig({ target: "aws", aws, sandbox: { backend: "agent37" } }, ({ path }) => {
+    const { config } = loadConfigAt(path);
+    assert.equal(config.sandbox?.backend, "agent37");
+    assert.equal(sandboxCoreEnv(config).env.SANDBOX_BACKEND, "agent37");
   });
   withConfig({ target: "aws", aws, sandbox: { backend: "sprites", app: "acme-sandboxes" } }, ({ path }) => {
     assert.equal(loadConfigAt(path).config.sandbox?.backend, "sprites");

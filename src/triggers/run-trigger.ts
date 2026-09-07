@@ -37,6 +37,7 @@ export interface TriggerDeps {
 }
 
 export interface TriggerSpec {
+  title?: string;
   owner: string;
   ownerScopeId: ScopeId;
   input: string;
@@ -74,7 +75,7 @@ function isTriggerFailure(outcome: TriggerOutcome): boolean {
 const NO_UPDATE_SENTINEL = "[no-update]";
 const SILENT_POLL_MARKERS = new Set([NO_UPDATE_SENTINEL, "no_reply", "[silent]"]);
 
-const POLL_SURFACES = new Set(["cron", "monitor"]);
+const POLL_SURFACES = new Set(["cron", "webhook", "monitor"]);
 export const isPollSurface = (surface: string): boolean => POLL_SURFACES.has(surface);
 
 export function isSilentPollReply(reply: string): boolean {
@@ -94,6 +95,7 @@ function deliveryProvenance(spec: TriggerSpec, threadRef: string, res?: TurnResu
     fireKey: spec.fireKey,
     sourceScopeId: spec.ownerScopeId,
     sourceThreadRef: threadRef,
+    ...(spec.title ? { sourceTitle: spec.title } : {}),
     ...(res?.sessionId ? { sourceSessionId: res.sessionId } : {}),
     ...(res?.sourceUserSeq !== undefined ? { sourceUserSeq: res.sourceUserSeq } : {}),
     ...(res?.sourceAssistantEntrySeq !== undefined ? { sourceAssistantEntrySeq: res.sourceAssistantEntrySeq } : {}),

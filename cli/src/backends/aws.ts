@@ -24,6 +24,7 @@ import { manifestRef } from "../manifest.ts";
 import { computedSecrets, runtimeSecretNames, secretsForService, type ComputedSecret } from "../secrets.ts";
 import {
   brokerWiring,
+  brandEnvOf,
   orgEnv,
   runnableServices,
   serviceDef,
@@ -244,13 +245,14 @@ export function serviceEnvironment(config: QmConfig, service: ServiceName): Reco
         }
       : {};
   const env: Record<string, string> = {
-    ...orgEnv(service, config.orgId, config.publicUrl, config.services.includes("portal")),
+    ...orgEnv(service, config.orgId, config.publicUrl, config.services.includes("portal"), brandEnvOf(config)),
     ...(service === "core" ? {} : { CORE_API_URL: coreUrl }),
     ...coreEnv,
     ...config.env[service],
     ...(service === "core" ? securityScreenEnv(config) : {}),
   };
   if (service === "core") {
+    const sandboxBackend = config.env.core?.SANDBOX_BACKEND?.trim() || config.sandbox?.backend;
     const stores = {
       DEPLOY_PROVIDER: "aws",
       AWS_DEPLOY_REGION: aws.region,
@@ -261,9 +263,9 @@ export function serviceEnvironment(config: QmConfig, service: ServiceName): Reco
       S3_BUCKET: config.env.core?.S3_BUCKET?.trim() || awsObjectStoreBucket(config),
       S3_REGION: aws.region,
     };
-    if (usesFlySandboxes(config)) {
+    if (sandboxBackend && sandboxBackend !== "aws") {
       Object.assign(env, sandboxCoreEnv(config).env, {
-        SANDBOX_BACKEND: config.env.core?.SANDBOX_BACKEND?.trim() || config.sandbox?.backend || "sprites",
+        SANDBOX_BACKEND: sandboxBackend,
         ...stores,
       });
     } else {
@@ -311,7 +313,7 @@ function workloadEnvironment(config: QmConfig, workload: string): Record<string,
   return Object.fromEntries(
     Object.entries({
       CORE_API_URL: `http://core.${requireAws(config).networking.cloudMapNamespace}:8080`,
-      ...orgEnv(workload, config.orgId, config.publicUrl, config.services.includes("portal")),
+      ...orgEnv(workload, config.orgId, config.publicUrl, config.services.includes("portal"), brandEnvOf(config)),
       ...plugin?.env,
       PORT: "8080",
     }).sort(([a], [b]) => a.localeCompare(b)),
@@ -2591,8 +2593,9 @@ function awsCoreHostnames(config: QmConfig): string[] {
     const apiHost = normalize(hostname, "apiUrl");
     if (apiHost !== new URL(config.publicUrl).hostname.toLowerCase().replace(/\.$/, "")) hosts.push(apiHost);
   }
-  const apps = config.env.core?.AWS_DEPLOY_APPS_DOMAIN?.trim();
-  if (apps) hosts.push(`*.${normalize(apps, "env.core.AWS_DEPLOY_APPS_DOMAIN")}`);
+  const apps = config.env.core?.DEPLOY_APPS_DOMAIN?.trim() || config.env.core?.AWS_DEPLOY_APPS_DOMAIN?.trim();
+  if (apps)
+    hosts.push(`*.${normalize(apps, "the apps domain (env.core.DEPLOY_APPS_DOMAIN or AWS_DEPLOY_APPS_DOMAIN)")}`);
   return [...new Set(hosts)];
 }
 

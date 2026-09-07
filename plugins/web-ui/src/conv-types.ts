@@ -84,6 +84,7 @@ export interface ChatSurface {
     inheritedMessages?: ReturnType<typeof entriesToMessages>,
   ): void;
   mountLoadingPane(): void;
+  scrollToBottom(): void;
   drawActiveChat(agent?: Agent | null, opts?: { forceScroll?: boolean }): void;
   setTranscriptWindow(anchorSeq: number | null, earlierCount: number, hasEarlier?: boolean): void;
   requestBackgroundPanel(sessionId: string | null, threadRef: string | null): void;
@@ -115,6 +116,7 @@ interface ComposerState {
 export interface ComposerSurface {
   state: ComposerState;
   composerForm(agent: Agent): TemplateResult;
+  queuedStrip(agent: Agent): TemplateResult | typeof import("lit").nothing;
   queuedRunsFor(threadRef: string | null): QueuedRun[];
   setQueuedRuns(threadRef: string, runs: QueuedRun[]): void;
   resetComposer(): void;

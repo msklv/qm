@@ -52,13 +52,16 @@ import type {
   CronPatchRequest,
   CronRunsRequest,
   CronRunsResult,
+  WebhookCreateRequest,
+  WebhookCreateResult,
   ControlOk,
   ControlErr,
 } from "../api/control-service.ts";
 import type { ShareArtifactRequest, ShareArtifactResult } from "../api/artifact-share.ts";
-import type { Cron } from "../types.ts";
+import type { Cron, Webhook } from "../types.ts";
 import type { CapabilityClaims } from "../auth/capability-token.ts";
 import type { VisibleCron } from "../api/app.ts";
+import { createPlaygroundArtifact, type PlaygroundArtifact } from "../playgrounds/playground.ts";
 
 const SKILL_SKILLMD_RE = /^(?:\.\/)?skills\/([^/]+)\/SKILL\.md$/;
 function skillTreeDirFor(path: string): string | null {
@@ -171,6 +174,7 @@ export interface ToolContext extends SurfaceToolDeps {
   read(path: string): Promise<ReadResult>;
   write(path: string, data?: string, share?: ShareDirective[]): Promise<WriteResult>;
   publish(input: PublishInput): Promise<PublishResult>;
+  createPlayground(input: { title: string; html: string }): Promise<PlaygroundArtifact>;
   memorySearch(q: string, limit?: number): Promise<string[] | null>;
   memoryRead(): Promise<string | null>;
   memoryRemember(facts: string[]): Promise<number | null>;
@@ -226,6 +230,11 @@ export interface ToolContext extends SurfaceToolDeps {
   ): Promise<
     ControlOk<{ cron: Cron }> | ControlErr<"not_found" | "forbidden" | "unknown_destination"> | ControlUnavailable
   >;
+  webhookCreate(req: WebhookCreateRequest): Promise<WebhookCreateResult | ControlUnavailable>;
+  webhookList(): Promise<Webhook[] | ControlUnavailable>;
+  webhookDisable(
+    id: string,
+  ): Promise<ControlOk<Record<never, never>> | ControlErr<"not_found" | "forbidden"> | ControlUnavailable>;
   soulRead(): { effectiveSoul: string; soul: string | null; soulVersion: number } | ControlUnavailable;
   soulWrite(
     content: string,
@@ -360,7 +369,7 @@ export interface ControlUnavailable {
 export const CONTROL_UNAVAILABLE: ControlUnavailable = {
   ok: false,
   code: "control_unavailable",
-  message: "the control plane (crons, standing instructions) isn't available on this turn",
+  message: "the control plane (crons, webhooks, standing instructions) isn't available on this turn",
 };
 
 export interface ToolContextDeps {
@@ -419,6 +428,7 @@ export interface ToolContextDeps {
   onGapWork?: (work: GapWork) => void;
   control?: ControlService;
   controlClaims?: CapabilityClaims;
+  webhookPublicUrl?: string;
   surface?: SurfaceToolDeps;
 }
 
@@ -668,6 +678,17 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
       });
     },
 
+    async createPlayground(input: { title: string; html: string }): Promise<PlaygroundArtifact> {
+      if (!deps.files || !writableScopeId) throw new Error("playgrounds require a writable artifact store");
+      return once(() =>
+        createPlaygroundArtifact(deps.files!, {
+          ...input,
+          ownerScopeId: writableScopeId,
+          createdBy: deps.createdBy,
+        }),
+      );
+    },
+
     async write(path: string, data?: string, share?: ShareDirective[]): Promise<WriteResult> {
       const wantShare = share !== undefined && share.length > 0;
       if (data === undefined && !wantShare) {
@@ -855,7 +876,7 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
       return timed("recall", async () => {
         const out: string[] = [];
         for (const scope of read) {
-          for (const fact of await deps.memory!.query(scope, q, limit)) {
+          for (const fact of await deps.memory!.query(scope, q, limit, { actorId: deps.createdBy })) {
             out.push(read.length > 1 ? `[${scope}] ${fact}` : fact);
           }
         }
@@ -872,7 +893,11 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
     async memoryRemember(facts: string[]): Promise<number | null> {
       const write = deps.memoryAccess?.write;
       if (!deps.memory || !write) return null;
-      return once(() => timed("memory_write", () => deps.memory!.capture(write, facts, Date.now(), deps.createdBy)));
+      return once(() =>
+        timed("memory_write", () =>
+          deps.memory!.capture(write, facts, Date.now(), deps.createdBy, { mode: "explicit", actorId: deps.createdBy }),
+        ),
+      );
     },
 
     async memoryRewrite(content: string): Promise<true | null> {
@@ -1013,6 +1038,17 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
     cronRetarget: (id, destinationKey) =>
       controlOp(
         (c, cl) => c.retargetCron(id, destinationKey, cl),
+        (r) => r.ok,
+      ),
+    webhookCreate: (req) =>
+      controlOp(
+        (c, cl) => c.createWebhook(req, cl, deps.webhookPublicUrl),
+        (r) => r.ok,
+      ),
+    webhookList: () => controlOp((c, cl) => c.listWebhooks(cl)),
+    webhookDisable: (id) =>
+      controlOp(
+        (c, cl) => c.disableWebhook(id, cl),
         (r) => r.ok,
       ),
     soulRead() {

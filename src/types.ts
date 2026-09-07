@@ -2,6 +2,12 @@ import type { ResolvedSecurityPolicy } from "./security/security-posture.ts";
 
 export type PrincipalType = "internal" | "guest";
 
+export const PRINCIPAL_TYPES = ["internal", "guest"] as const satisfies readonly PrincipalType[];
+
+export function isPrincipalType(value: unknown): value is PrincipalType {
+  return typeof value === "string" && (PRINCIPAL_TYPES as readonly string[]).includes(value);
+}
+
 export interface Principal {
   id: string;
   type: PrincipalType;
@@ -166,6 +172,7 @@ export interface Destination {
   target: string;
   audienceScopeId?: ScopeId;
   onBehalfOf?: string;
+  threadTs?: string;
   editRef?: string;
   taskList?: Array<{
     id: string;
@@ -187,6 +194,7 @@ export interface CandidateDestination extends Destination {
 export type BackgroundWakeTrigger = "cron" | "webhook" | "monitor" | (string & {});
 
 export interface DeliveryProvenance {
+  sourceTitle?: string;
   trigger: BackgroundWakeTrigger;
   surface: string;
   fireKey: string;
@@ -228,6 +236,24 @@ export interface Cron extends TriggerBase {
   members?: Principal[];
   unattendedGrants?: string[];
   fireLog?: CronFireLogEntry[];
+}
+
+interface WebhookVerification {
+  scheme: "hmac-sha256" | "github" | "slack" | "stripe";
+  secret?: string;
+}
+
+interface WebhookFilter {
+  path: string;
+  in: string[];
+}
+
+export interface Webhook extends TriggerBase {
+  action: string;
+  verification: WebhookVerification;
+  filters?: WebhookFilter[];
+  lastDeliveryId?: string;
+  lastError?: string;
 }
 
 export interface Monitor extends TriggerBase {
@@ -344,7 +370,7 @@ export interface GatewayContext {
   details?: Record<string, string>;
   instructions?: string;
   reactionGuidance?: string;
-  botName?: string;
+  botHandle?: string;
 }
 
 export interface ConversationTurn {
@@ -396,6 +422,7 @@ export interface TurnRequest {
   ownerKeychainUnion?: boolean;
   unprompted?: boolean;
   liveActor?: boolean;
+  botActor?: boolean;
   conversationHeader?: string;
   priorTurns?: ConversationTurn[];
   overheard?: OverheardMessage[];
@@ -439,10 +466,11 @@ export interface PendingApproval {
   matched?: string;
   purpose?: string;
   summary?: string;
+  summaryDetail?: string;
   approvalKey?: string;
   grantModes?: ApprovalGrantModes;
   blocksInput?: boolean;
-  kind?: "approval";
+  kind?: "approval" | "input";
 }
 
 export interface PendingApprovalRecord {
@@ -453,6 +481,7 @@ export interface PendingApprovalRecord {
   matched?: string;
   purpose?: string;
   summary?: string;
+  summaryDetail?: string;
   approvalKey?: string;
   grantModes?: ApprovalGrantModes;
   request?: TurnRequest;

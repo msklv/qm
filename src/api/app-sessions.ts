@@ -321,7 +321,7 @@ export function createSessionMethods(
       if (!deps.identity.isInternal(deps.identity.classify(principalId))) return { status: "forbidden" };
       const existing = await deps.projects.get(id);
       if (!existing || existing.orgId !== orgIdOf()) return { status: "not_found" };
-      const directoryMember = await deps.directory.get(memberId);
+      const directoryMember = await h.directoryMember(memberId);
       const principal = deps.identity.classify(memberId);
       if (!directoryMember || directoryMember.type !== "internal" || !deps.identity.isInternal(principal))
         return { status: "invalid_member" };
@@ -447,9 +447,10 @@ export function createSessionMethods(
 
     async listScopeResources(principalId, scope) {
       if (!(await principalCanAccessCurrentScope(principalId, scope))) return null;
-      const [page, allCrons, allDeployments, allSkills] = await Promise.all([
+      const [page, allCrons, allWebhooks, allDeployments, allSkills] = await Promise.all([
         filesForViewer(principalId, undefined, scope),
         deps.crons.list(),
+        deps.webhooks.list(),
         deps.deploy.listDeployments(),
         deps.skills.list(),
       ]);
@@ -477,6 +478,7 @@ export function createSessionMethods(
         .map((s) => ({ id: s.id, name: s.manifest.name, description: s.manifest.description, status: s.status }));
       return {
         files,
+        webhooks: allWebhooks.filter((w) => w.ownerScopeId === scope),
         crons: allCrons.filter((c) => c.ownerScopeId === scope),
         deployments,
         skills,

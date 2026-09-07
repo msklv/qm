@@ -18,6 +18,8 @@ import {
 import {
   isVirtualService,
   ordered,
+  type BrandEnv,
+  brandEnvOf,
   orgEnv,
   runnableServices,
   serviceDef,
@@ -40,19 +42,23 @@ import { flySandboxRepository, imageRepository, pinnedByDigest, recordSandboxPin
 import { manifestRef } from "../manifest.ts";
 import { CONNECTIVITY_CODES, CoreUnreachableError, type DeploymentLayerTransport } from "../deployment-layer.ts";
 
-const flyServiceCtx = (config: QmConfig, appPrefix: string, deployAppPrefix: string): ServiceCtx => ({
-  appPrefix,
-  orgId: config.orgId,
-  deployAppPrefix,
-  publicUrl: config.publicUrl,
-  hasPortal: config.services.includes("portal"),
-  hasAuth: config.services.includes("auth"),
-  ...(config.env.auth?.AUTH_ALLOWED_EMAIL_DOMAIN
-    ? { authAllowedEmailDomain: config.env.auth.AUTH_ALLOWED_EMAIL_DOMAIN }
-    : {}),
-  coreUrl: `http://${appPrefix}-core.internal:8080`,
-  authUrl: `http://${appPrefix}-auth.flycast`,
-});
+const flyServiceCtx = (config: QmConfig, appPrefix: string, deployAppPrefix: string): ServiceCtx => {
+  const brand = brandEnvOf(config);
+  return {
+    appPrefix,
+    orgId: config.orgId,
+    deployAppPrefix,
+    publicUrl: config.publicUrl,
+    hasPortal: config.services.includes("portal"),
+    hasAuth: config.services.includes("auth"),
+    ...(config.env.auth?.AUTH_ALLOWED_EMAIL_DOMAIN
+      ? { authAllowedEmailDomain: config.env.auth.AUTH_ALLOWED_EMAIL_DOMAIN }
+      : {}),
+    ...(brand ? { brand } : {}),
+    coreUrl: `http://${appPrefix}-core.internal:8080`,
+    authUrl: `http://${appPrefix}-auth.flycast`,
+  };
+};
 
 const FLY_RESPONSE = "QM_LAYER_RESPONSE=";
 const FLY_REMOTE_ERROR = "QM_LAYER_ERROR=";
@@ -212,6 +218,29 @@ function stageSecret(app: string, name: string, value: string): void {
     stdio: ["pipe", "inherit", "inherit"],
   });
   if (result.status !== 0) throw new CliError(`failed to stage ${name} on ${app}`);
+}
+
+export function stageFlyEmailAllowlist(
+  config: QmConfig,
+  configDir: string,
+  selectedWorkloads: ReadonlySet<string>,
+): void {
+  const values = readEnvFile(join(configDir, ".env"));
+  const value = deploymentSecretValue("AUTH_ALLOWED_EMAILS", values.get("AUTH_ALLOWED_EMAILS"));
+  if (value === undefined) return;
+  if (isInvalidSecret("AUTH_ALLOWED_EMAILS", value)) {
+    throw new CliError("required secret AUTH_ALLOWED_EMAILS is missing or invalid");
+  }
+  const secret = computedSecrets(config).find((candidate) => candidate.name === "AUTH_ALLOWED_EMAILS");
+  if (!secret) return;
+  const staged: string[] = [];
+  for (const [workload, names] of secretDestinations(secret)) {
+    if (!selectedWorkloads.has(workload)) continue;
+    const app = `${appPrefixOf(config)}-${workload}`;
+    for (const name of names) stageSecret(app, name, value);
+    staged.push(app);
+  }
+  if (staged.length) step(`AUTH_ALLOWED_EMAILS: staged from .env on ${staged.join(", ")}`);
 }
 
 function flySensitive(args: string[], failure: string): string {
@@ -857,10 +886,11 @@ function pluginTomlContent(
   hasPortal: boolean,
   region: string,
   plugin: ResolvedPlugin,
+  brand?: BrandEnv,
 ): string {
   const env: Record<string, string> = {
     CORE_API_URL: `http://${appPrefix}-core.internal:8080`,
-    ...orgEnv(plugin.name, orgId, publicUrl, hasPortal),
+    ...orgEnv(plugin.name, orgId, publicUrl, hasPortal, brand),
     PORT: "8080",
     ...plugin.env,
     [FLY_DEPLOYMENT_ID_ENV]: flyDeploymentId(flyOrg, orgId, appPrefix),
@@ -889,6 +919,7 @@ export function derivedPluginTomlFor(config: QmConfig, plugin: ResolvedPlugin): 
     config.services.includes("portal"),
     config.region ?? "",
     plugin,
+    brandEnvOf(config),
   );
 }
 
@@ -905,6 +936,7 @@ function writePluginDerived(ctx: FlyCtx, plugin: ResolvedPlugin): string {
       ctx.config.services.includes("portal"),
       ctx.region,
       plugin,
+      brandEnvOf(ctx.config),
     ),
   );
   return path;
@@ -1097,6 +1129,10 @@ export async function flyUp(config: QmConfig, configDir: string, opts: FlyUpOpts
       note("");
       ok(`deployment images for ${ctx.appPrefix} built.`);
       return;
+    }
+
+    if (!opts.dryRun) {
+      stageFlyEmailAllowlist(config, configDir, new Set([...services, ...plugins.map((plugin) => plugin.name)]));
     }
 
     const gateSecrets = (app: string, header: string, path: string, required: string[], timingKey: string): boolean => {
@@ -1596,6 +1632,7 @@ export async function flyCheckLive(
             config.services.includes("portal"),
             ctx.region,
             plugin!,
+            brandEnvOf(config),
           ),
     );
     const envDrift = machines.flatMap((machine, index) =>

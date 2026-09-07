@@ -17,6 +17,7 @@ import { orgId } from "../config.ts";
 import { renderGatewayContext } from "./gateway-context.ts";
 import { deriveTurnOutcome, approvalBlocksInput } from "./turn-outcome.ts";
 import { applyPromptVars, loadProtocolFile, type PromptVars } from "../resolution/prompt-vars.ts";
+import { cleanBrandingLabel, resolveBranding } from "../resolution/branding.ts";
 import { resolveReachableChannel } from "../resolution/scope-reach.ts";
 import { reachEnqueue } from "../reach/reach.ts";
 import type { DirectoryStore, DirectoryChannel, DirectoryMember } from "../directory/directory-store.ts";
@@ -28,7 +29,11 @@ import { createBackgroundBroker } from "../connectors/background-exec-broker.ts"
 import { createMonitorBroker, readBackgroundOutputTail } from "../monitors/monitor-broker.ts";
 import { isPollSurface, isSilentPollReply } from "../triggers/run-trigger.ts";
 import { envKey } from "../credentials/connector-token.ts";
-import { renderKeychainManifest, type MaterializedEnvCred } from "../credentials/keychain.ts";
+import {
+  renderKeychainManifest,
+  type MaterializedEnvCred,
+  type PublicServiceCredential,
+} from "../credentials/keychain.ts";
 import { captureDeviceFlowLogins, deviceFlowCredOwner } from "../credentials/device-flow-persist.ts";
 import type { DeviceFlowCutoverMode } from "../credentials/device-flow-cutover.ts";
 import { type ResidentAuthConnector, RESIDENT_AUTH_CONNECTORS, mergeConnectors } from "../credentials/resident-auth.ts";
@@ -50,7 +55,7 @@ import {
   isValidCapabilityTimezone,
   type CapabilityClaims,
 } from "../auth/capability-token.ts";
-import type { GapWork, HarnessLlmRequestRecord } from "../harness/harness.ts";
+import type { GapWork, HarnessLlmRequestRecord, HarnessTurnResult } from "../harness/harness.ts";
 import { forModelContext } from "../harness/context-compaction.ts";
 import {
   renderSecurityPolicyPrompt,
@@ -58,7 +63,7 @@ import {
   UNSCREENED_REASON,
   unscreenedNotice,
 } from "../security/security-posture.ts";
-import { commandApprovalId } from "./approval-id.ts";
+import { commandApprovalId, inputApprovalId } from "./approval-id.ts";
 import { createPerTurnStrategy } from "../memory/strategies/per-turn.ts";
 import { DEFAULT_MEMORY_POLICY, recallMemoryScopes, writableMemoryScope } from "../memory/policy.ts";
 import { createMemoryMap } from "../persistence/durable-map.ts";
@@ -113,7 +118,6 @@ import { parseRef } from "../acl/resource-ref.ts";
 import { findTrailingPartialTurn, resumeNote } from "./turn-resume.ts";
 import {
   coverageImportEvent,
-  reconstructMessagesFromHistory,
   recordedMessageTimestamps,
   renderOverheard,
   selectOverheardToImport,
@@ -129,7 +133,10 @@ import { randomUUID } from "node:crypto";
 import { LRUCache } from "lru-cache";
 import type { SkillResolution, GrantedSkillRef } from "../skills/skill-store.ts";
 import type { Orchestrator, OrchestratorDeps, OrchestratorInput } from "./orchestrator/types.ts";
-import { resolveModel } from "../model/pi-models.ts";
+import { resolveModel, CODEX_SUBSCRIPTION_PROVIDER } from "../model/pi-models.ts";
+import type { ProviderKeys } from "../harness/pi-harness.ts";
+import type { CodexTurnAuth } from "../harness/harness.ts";
+import { resolveIndividualAuthRouting } from "./individual-auth-routing.ts";
 import {
   MAX_AUTO_ATTACHMENT_SCREEN_BYTES,
   approvalGrantId,
@@ -285,7 +292,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
   }
 
   function recordSessionBusy(busy: {
-    site: "turn" | "quarantined_input";
+    site: "turn" | "quarantined_input" | "flagged_input";
     attempt: LeaseAttempt;
     sessionId: string;
     scopeId: ScopeId;
@@ -343,8 +350,8 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         actor.id,
         scopeLabel,
         sessionId
-          ? async (rec) => {
-              await deps.sessions.recordLlmRequest(sessionId, { ...rec, scopeLabel });
+          ? async (rec, signal) => {
+              await deps.sessions.recordLlmRequest(sessionId, { ...rec, scopeLabel }, signal);
             }
           : undefined,
         { hook: "user_input", surface: "steer", origin: "ambient" },
@@ -504,22 +511,37 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         await deps.harness.turns.resetSession?.(sessionId);
       };
       const securityPolicy = resolution.securityPolicy;
+      const approvalSession = input.approval ? await deps.sessions.getByThread(conversation.threadRef) : null;
+      const approvalRecord = input.approval ? await pending.get(input.approval.requestId) : undefined;
+      const approvalReplaysFlaggedRequest =
+        !!approvalRecord?.request &&
+        approvalRecord.request.text === input.text &&
+        JSON.stringify(approvalRecord.request.overheard ?? []) === JSON.stringify(input.overheard ?? []) &&
+        JSON.stringify(approvalRecord.request.attachments ?? []) === JSON.stringify(input.attachments ?? []) &&
+        (approvalRecord.request.conversationHeader ?? "") === (input.conversationHeader ?? "");
+      const screenInbound =
+        securityPolicy.inboundScreening === "external" &&
+        !(
+          approvalSession &&
+          approvalRecord?.sessionId === approvalSession.id &&
+          approvalRecord.kind === "input" &&
+          approvalReplaysFlaggedRequest
+        );
       const screenSession: { id?: string } = {};
       const pendingScreenRequests: HarnessLlmRequestRecord[] = [];
-      const recordScreenRequest = async (rec: HarnessLlmRequestRecord): Promise<void> => {
+      const recordScreenRequest = async (rec: HarnessLlmRequestRecord, signal?: AbortSignal): Promise<void> => {
         if (!screenSession.id) {
           pendingScreenRequests.push(rec);
           return;
         }
         try {
-          await deps.sessions.recordLlmRequest(screenSession.id, { ...rec, scopeLabel: scopeId });
+          await deps.sessions.recordLlmRequest(screenSession.id, { ...rec, scopeLabel: scopeId }, signal);
         } catch (err) {
           console.error("[orchestrator] failed to persist security screen request snapshot:", errMessage(err));
         }
       };
       let screenedOverheard: OverheardEntryPayload[] = [];
-      let seedPriorTurns = false;
-      if (securityPolicy.inboundScreening === "external") {
+      if (screenInbound) {
         const existingSession = await deps.sessions.getByThread(conversation.threadRef);
         const existingEntries = existingSession ? await deps.sessions.getEntries(existingSession.id) : [];
         const quarantinedAttachmentSourceIds = new Set(
@@ -540,21 +562,10 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         }
         const recorded = recordedMessageTimestamps(existingEntries);
         screenedOverheard = conversation.kind === "dm" ? [] : selectOverheardToImport(input.overheard ?? [], recorded);
-        const tainted = existingEntries.some(
-          (entry) => (entry.payload as { securityTainted?: unknown } | null)?.securityTainted === true,
-        );
-        if (!tainted && input.priorTurns?.length) {
-          try {
-            const cleanHistory = filterHistory(forModelContext(existingEntries, { includeSecurityTainted: false }));
-            seedPriorTurns = reconstructMessagesFromHistory(cleanHistory).length === 0;
-          } catch {
-            seedPriorTurns = true;
-          }
-        }
       }
       let hasUnscreenableAttachment = false;
       const attachmentPromptData: Array<{ source: string; content: string }> = [];
-      if (securityPolicy.inboundScreening === "external") {
+      if (screenInbound) {
         for (const attachment of input.attachments ?? []) {
           attachmentPromptData.push({
             source: "attachment-metadata",
@@ -588,38 +599,28 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           });
         }
       }
-      const externalPromptData =
-        securityPolicy.inboundScreening === "external"
-          ? [
-              ...(ambientTurn && actor.displayName?.trim()
-                ? [{ source: "sender", content: senderNote(actor.displayName) }]
-                : []),
-              ...(input.conversationHeader?.trim()
-                ? [{ source: "conversation-header", content: input.conversationHeader }]
-                : []),
-              ...(seedPriorTurns && conversation.kind !== "dm"
-                ? (input.priorTurns ?? [])
-                    .filter((turn) => turn.role === "user")
-                    .map((turn) => ({
-                      source: `prior-turn:${turn.role}${turn.name ? `:${turn.name}` : ""}`,
-                      content: turn.text,
-                    }))
-                : []),
-              ...screenedOverheard.map((entry) => ({ source: "overheard", content: renderOverheard(entry) })),
-              ...attachmentPromptData,
-              ...(input.inboundNotes ?? []).map((note) => ({ source: "inbound-file-note", content: note })),
-            ]
-          : [];
-      const screenPayload =
-        securityPolicy.inboundScreening === "external"
-          ? securityScreenPayload({
-              ...input,
-              ...turnOriginRequestFields(input.origin),
-              overheard: [],
-              externalPromptData,
-            })
-          : null;
-      let quarantineScreenedInput = false;
+      const externalPromptData = screenInbound
+        ? [
+            ...(ambientTurn && actor.displayName?.trim()
+              ? [{ source: "sender", content: senderNote(actor.displayName) }]
+              : []),
+            ...(input.conversationHeader?.trim()
+              ? [{ source: "conversation-header", content: input.conversationHeader }]
+              : []),
+            ...screenedOverheard.map((entry) => ({ source: "overheard", content: renderOverheard(entry) })),
+            ...attachmentPromptData,
+            ...(input.inboundNotes ?? []).map((note) => ({ source: "inbound-file-note", content: note })),
+          ]
+        : [];
+      const screenPayload = screenInbound
+        ? securityScreenPayload({
+            ...input,
+            ...turnOriginRequestFields(input.origin),
+            overheard: [],
+            externalPromptData,
+          })
+        : null;
+      let flaggedScreenedInput: { reason: string; sources: string[] } | undefined;
       let inputUnscreened = false;
       if (screenPayload || hasUnscreenableAttachment) {
         const canScreenText =
@@ -638,15 +639,19 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         else if (screenPayload.truncated) unscreenableCause = "oversize-input";
         else if (!deps.securityScreener && !deps.harness.models.screenSecurity) unscreenableCause = "no-screener";
         if (verdict?.decision === "strict") {
-          quarantineScreenedInput = true;
+          const sources = externalPromptData.map((item) => item.source);
+          flaggedScreenedInput = {
+            reason: verdict.reason ?? "strict security screen verdict",
+            sources,
+          };
           deps.auditLog.record({
             at: Date.now(),
             principalId: actor.id,
-            action: "security_posture.quarantine",
+            action: "security_posture.flagged",
             resource: input.surface ?? "unknown",
             scopeLabel: scopeId,
-            status: "refused",
-            detail: JSON.stringify({ cause: "strict-verdict", ...(verdict.reason ? { reason: verdict.reason } : {}) }),
+            status: "pending_approval",
+            detail: JSON.stringify({ cause: "strict-verdict", reason: flaggedScreenedInput.reason, source: sources }),
           });
         } else if (unscreenableCause || verdict?.unscreened) {
           inputUnscreened = true;
@@ -661,7 +666,28 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           });
         }
       }
-      if (quarantineScreenedInput) {
+      if (flaggedScreenedInput) {
+        const existing = await deps.sessions.getByThread(conversation.threadRef);
+        const flagGrantKey = `security-screen:${input.surface ?? "unknown"}`;
+        for (const grant of await approvalGrants.all()) {
+          if (!samePerson(grant.actorId, actor.id)) continue;
+          if (!resolution.approvalGrantModes[grant.scope]) continue;
+          if (grant.scope === "session" && grant.sessionId !== existing?.id) continue;
+          if ((grant.approvalKey ?? grant.command) !== flagGrantKey && grant.command !== "security-screen") continue;
+          deps.auditLog.record({
+            at: Date.now(),
+            principalId: actor.id,
+            action: "security_posture.flag_allowed_by_grant",
+            resource: input.surface ?? "unknown",
+            scopeLabel: scopeId,
+            status: "allowed",
+            detail: JSON.stringify({ scope: grant.scope, reason: flaggedScreenedInput.reason }),
+          });
+          flaggedScreenedInput = undefined;
+          break;
+        }
+      }
+      if (flaggedScreenedInput) {
         let type: SessionType = "channel";
         if (conversation.kind === "dm") type = "dm";
         else if (conversation.kind === "group") type = "group";
@@ -679,7 +705,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         const lease = attempt.lease;
         if (!lease) {
           recordSessionBusy({
-            site: "quarantined_input",
+            site: "flagged_input",
             attempt,
             sessionId: session.id,
             scopeId,
@@ -691,7 +717,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         try {
           await withManagedRosterVersion(async () => {
             await reconcileSessionParticipants(session.id);
-            await Promise.all(pendingScreenRequests.splice(0).map(recordScreenRequest));
+            await Promise.all(pendingScreenRequests.splice(0).map((rec) => recordScreenRequest(rec)));
             for (const overheard of screenedOverheard) {
               const imported = await deps.sessions.append(lease, {
                 type: "user",
@@ -710,11 +736,12 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                   entrySeq: imported.seq,
                   meta: { overheard: true, ts: overheard.ts, ...(overheard.name ? { author: overheard.name } : {}) },
                 })
-                .catch(swallowAs("tape: quarantined overheard import", undefined));
+                .catch(swallowAs("tape: flagged overheard import", undefined));
             }
-            const payload: Record<string, unknown> = {
+            const taintedPayload: Record<string, unknown> = {
               text: input.text,
               securityTainted: true,
+              hidden: true,
               ...((input.attachments ?? []).some((attachment) => attachment.sourceId)
                 ? {
                     quarantinedAttachmentSourceIds: input.attachments!.flatMap((attachment) =>
@@ -722,12 +749,28 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                     ),
                   }
                 : {}),
-              ...(automatedTurn ? { hidden: true } : {}),
               ...((messageTs ?? entryTs) ? { ts: messageTs ?? entryTs } : {}),
               ...(actor.displayName?.trim() ? { name: actor.displayName.trim() } : {}),
-              ...(input.displayText?.trim() ? { display: input.displayText } : {}),
             };
-            await deps.sessions.append(lease, { type: "user", payload, scopeLabel: scopeId });
+            await deps.sessions.append(lease, { type: "user", payload: taintedPayload, scopeLabel: scopeId });
+            const command = "security-screen";
+            const requestId = inputApprovalId(session.id, replayableRequest(input));
+            const grantModesField =
+              resolution.approvalGrantModes.session && resolution.approvalGrantModes.always
+                ? {}
+                : { grantModes: resolution.approvalGrantModes };
+            const reason = `${flaggedScreenedInput.reason}; flagged sources: ${flaggedScreenedInput.sources.join(", ") || "message"}`;
+            await pending.put(requestId, {
+              sessionId: session.id,
+              command,
+              createdAt: Date.now(),
+              reason,
+              request: replayableRequest(input),
+              blocksInput: true,
+              kind: "input",
+              approvalKey: `security-screen:${input.surface ?? "unknown"}`,
+              ...grantModesField,
+            });
             return true;
           });
         } catch (err) {
@@ -743,10 +786,21 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           await deps.sessions.releaseLease(lease);
         }
         return {
-          status: "refused",
+          status: "pending_approval",
           sessionId: session.id,
-          refusalKind: "security_quarantine",
-          reason: "Auto quarantined suspicious or unscreenable external input before the agent ran.",
+          pendingApprovals: [
+            {
+              requestId: inputApprovalId(session.id, replayableRequest(input)),
+              command: "security-screen",
+              reason: `${flaggedScreenedInput.reason}; flagged sources: ${flaggedScreenedInput.sources.join(", ") || "message"}`,
+              blocksInput: true,
+              kind: "input",
+              approvalKey: `security-screen:${input.surface ?? "unknown"}`,
+              ...(resolution.approvalGrantModes.session && resolution.approvalGrantModes.always
+                ? {}
+                : { grantModes: resolution.approvalGrantModes }),
+            },
+          ],
         };
       }
       const strictReadOnly = input.readOnly === true;
@@ -778,7 +832,15 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       let recallMs = 0;
       for (const recallScope of recallScopes) {
         const recallStart = Date.now();
-        const body = (await deps.memory.recall(recallScope)).trim();
+        const body = (
+          await deps.memory.recall(recallScope, {
+            query: input.text,
+            actorId: actor.id,
+            conversationScopeId: scopeId,
+            maxChars: 6_000,
+            ...(automatedTurn ? { autonomous: true } : {}),
+          })
+        ).trim();
         recallMs += Date.now() - recallStart;
         if (!body) continue;
         recalledSections.push(recallScopes.length === 1 ? body : `### ${recallScope}\n${body}`);
@@ -787,8 +849,11 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       const isWeb = input.surface === "web";
       const isSlack = input.surface === "slack";
       const surfaceTool = input.surface ?? "slack";
-      const botName = input.gatewayContext?.botName?.trim() || undefined;
-      const orgName = "this organization";
+      const branding = await resolveBranding(deps.config, resolution.orgScopeId, deps.brandingDefault);
+      const botName = branding.selfLabel ?? "QM";
+      const orgName = branding.orgName ?? "this organization";
+      const rawHandle = cleanBrandingLabel(input.gatewayContext?.botHandle?.replace(/^@/, ""), 40);
+      const botHandle = rawHandle && rawHandle.toLowerCase() !== botName.toLowerCase() ? rawHandle : undefined;
       let modeName = "mode-fallback";
       if (input.surfaceTools) modeName = "mode-autonomous";
       else if (!automatedTurn && (conversation.kind === "dm" || isWeb)) modeName = "mode-conversation";
@@ -800,9 +865,10 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         frameVars = { botName, surfaceTool, slack: isSlack };
       } else if (modeName === "mode-conversation") {
         frameVars = {
-          userName: actor.displayName?.trim() || "there",
+          botName,
+          userName: cleanBrandingLabel(actor.displayName, 80) ?? "there",
           userEmail: actor.id.includes("@") ? actor.id : undefined,
-          surfaceLabel: isWeb ? "the QM web app" : "Slack",
+          surfaceLabel: isWeb ? `the ${botName} web app` : "Slack",
           slack: isSlack,
           web: isWeb,
         };
@@ -811,7 +877,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       if (modeName === "mode-conversation" && input.proactiveOpener) {
         modeFrame += "\nNo one has written yet; open the conversation yourself per the onboarding note below.";
       }
-      const sharedCore = applyPromptVars(SHARED_CORE_MD, { botName, orgName });
+      const sharedCore = applyPromptVars(SHARED_CORE_MD, { botName, botHandle, orgName });
       let systemPrompt = `${modeFrame}\n\n${resolution.systemPrompt}\n\n${sharedCore}\n\n${renderSecurityPolicyPrompt(securityPolicy)}`;
       const scopeProfile = supportsScopeProfile(deps.sandbox)
         ? await deps.sandbox
@@ -952,6 +1018,26 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         commandUses.set(key, n - 1);
         return true;
       };
+      const quarantineReleaseApprovals: Array<{
+        command: string;
+        reason: string;
+        purpose: string;
+        summary: string;
+        summaryDetail: string;
+        approvalKey: string;
+        grantModes: { session: boolean; always: boolean };
+      }> = [];
+      const quarantinePreview = (payload: string): string => {
+        const cleaned = payload
+          .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+        return cleaned.length > 240 ? `${cleaned.slice(0, 240)}…` : cleaned;
+      };
+      const quarantineFullText = (payload: string): string => {
+        const cleaned = payload.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, " ").trim();
+        return cleaned.length > 16_000 ? `${cleaned.slice(0, 16_000)}…` : cleaned;
+      };
       const brokeredTools = deps.brokeredTools ?? [];
       const cutoverModes = new Map<string, DeviceFlowCutoverMode>();
       for (const tool of brokeredTools) {
@@ -1032,14 +1118,37 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       const authoredDetection =
         input.origin.kind === "ambient" && input.origin.live === true && conversation.kind !== "dm";
       const liveAuthorTurn = (humanTurn || authoredDetection) && allInternal;
+      // Service credentials: one read of the org's credential list and one grant scan feed both
+      // the env-delivery gate (below) and the broker token mint (further down). Same grants gate both.
+      let serviceCredRecords: PublicServiceCredential[] = [];
+      let grantedCredSlugs = new Set<string>();
+      if (!strictReadOnly && deps.serviceCreds) {
+        serviceCredRecords = await deps.serviceCreds.listServiceCredentials(resolution.orgScopeId);
+        if (serviceCredRecords.length > 0) {
+          grantedCredSlugs = new Set(
+            (
+              await deps.acl.grantsOfKind(
+                "service-cred",
+                conversation.audience,
+                scopeId,
+                resolution.orgScopeId,
+                principalEntitledToScope,
+              )
+            ).map((g) => parseRef(g.ref).id),
+          );
+        }
+      }
       if (!strictReadOnly && allInternal && deps.serviceCreds) {
         const orgScope = toScopeId("org", orgId());
-        for (const cred of await deps.serviceCreds.listServiceCredentials(orgScope)) {
+        // Env delivery is gated by the same service-cred grants as the broker: the env var rides
+        // only when every internal participant in this conversation is entitled to the credential.
+        for (const cred of serviceCredRecords) {
           if (
             cred.delivery !== "env" ||
             !cred.envKey ||
             !cred.enabled ||
             !cred.hasSecret ||
+            !grantedCredSlugs.has(cred.slug) ||
             cred.envKey in connectorEnv
           )
             continue;
@@ -1061,6 +1170,14 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       let actorIsOrgAdmin = false;
       let orgMemoryWrite: ScopeId | undefined;
       let controlClaims: CapabilityClaims | undefined;
+      const scopeAttestation = {
+        actorId: actor.id,
+        scopeId,
+        ...(input.scopeVersion ? { scopeVersion: input.scopeVersion } : {}),
+        ...(conversation.publishMembers ? { members: conversation.publishMembers } : {}),
+        ...(liveTurn ? { liveActor: true } : {}),
+        ...(input.botActor ? { botActor: true } : {}),
+      };
       if (!strictReadOnly && deps.signingSecret && deps.apiBaseUrl) {
         const destination = defaultDestination;
         connectorEnv.AGENT_API_URL = deps.apiBaseUrl;
@@ -1082,16 +1199,13 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           ? { ...memoryAccess, ...(orgMemoryWrite ? { orgWrite: orgMemoryWrite } : {}) }
           : undefined;
         controlClaims = {
-          actorId: actor.id,
-          scopeId,
-          ...(input.scopeVersion ? { scopeVersion: input.scopeVersion } : {}),
+          ...scopeAttestation,
           aud: CONTROL_PLANE_AUD,
           exp: Date.now() + CAPABILITY_TTL_MS,
           ...(turnTimezone ? { timezone: turnTimezone } : {}),
           ...(destination ? { destination } : {}),
           ...(delivery.candidates.length > 0 ? { destinations: delivery.candidates } : {}),
           ...(delivery.defaultKey ? { defaultDestinationKey: delivery.defaultKey } : {}),
-          ...(conversation.publishMembers ? { members: conversation.publishMembers } : {}),
           ...(conversation.kind !== "dm"
             ? { keychainMembers: conversation.audience.filter((p) => p.type === "internal") }
             : {}),
@@ -1102,7 +1216,6 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             ? { privateScope: true }
             : {}),
           ...(memoryClaim ? { memory: memoryClaim } : {}),
-          ...(liveTurn ? { liveActor: true } : {}),
           ...(liveAuthorTurn ? { liveAuthor: true } : {}),
           ...(automatedTurn ? { triggered: true } : {}),
           ...(!liveTurn && input.unattendedGrants ? { grants: input.unattendedGrants } : {}),
@@ -1114,34 +1227,23 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         );
         connectorEnv.AGENT_OAUTH_CONSENT_TOKEN = await mintCapabilityToken(
           {
-            actorId: actor.id,
-            scopeId,
-            ...(input.scopeVersion ? { scopeVersion: input.scopeVersion } : {}),
+            ...scopeAttestation,
             aud: OAUTH_CONSENT_AUD,
             exp: Date.now() + CAPABILITY_TTL_MS,
           },
           deps.capabilitySecret ?? deps.signingSecret,
         );
         if (deps.serviceCreds) {
-          const records = await deps.serviceCreds.listServiceCredentials(resolution.orgScopeId);
+          const records = serviceCredRecords;
           const enabled = new Set(
             records.filter((r) => r.enabled && r.hasSecret && r.delivery !== "env").map((r) => r.slug),
           );
           if (enabled.size > 0) {
-            const grants = await deps.acl.grantsOfKind(
-              "service-cred",
-              conversation.audience,
-              scopeId,
-              resolution.orgScopeId,
-              principalEntitledToScope,
-            );
-            const slugs = [...new Set(grants.map((g) => parseRef(g.ref).id))].filter((s) => enabled.has(s));
+            const slugs = [...grantedCredSlugs].filter((s) => enabled.has(s));
             if (slugs.length > 0) {
               connectorEnv.AGENT_CREDENTIAL_TOKEN = await mintCapabilityToken(
                 {
-                  actorId: actor.id,
-                  scopeId,
-                  ...(input.scopeVersion ? { scopeVersion: input.scopeVersion } : {}),
+                  ...scopeAttestation,
                   aud: CREDENTIAL_BROKER_AUD,
                   credentials: slugs,
                   exp: Date.now() + CAPABILITY_TTL_MS,
@@ -1180,8 +1282,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       if (!strictReadOnly && egressSecret) {
         egressTokenForTurn = await mintCapabilityToken(
           {
-            actorId: actor.id,
-            scopeId,
+            ...scopeAttestation,
             aud: EGRESS_PROXY_AUD,
             egress: egressClaimAllowingControlPlane(
               resolution.egress,
@@ -1319,7 +1420,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       try {
         await withManagedRosterVersion(async () => {
           await reconcileSessionParticipants(session.id);
-          await Promise.all(pendingScreenRequests.splice(0).map(recordScreenRequest));
+          await Promise.all(pendingScreenRequests.splice(0).map((rec) => recordScreenRequest(rec)));
           return true;
         });
         if (input.approval) {
@@ -1341,7 +1442,11 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             };
           } else if (p && p.sessionId === session.id) {
             const scope = input.approval.scope ?? "once";
-            if (scope !== "once" && !resolution.approvalGrantModes[scope]) {
+            const recordDisallowsScope =
+              scope !== "once" &&
+              p.grantModes?.[scope] === false &&
+              p.approvalKey?.startsWith("security-screen-release:") === true;
+            if (scope !== "once" && (!resolution.approvalGrantModes[scope] || recordDisallowsScope)) {
               deps.auditLog.record({
                 at: Date.now(),
                 principalId: actor.id,
@@ -1353,24 +1458,32 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               return {
                 status: "pending_approval",
                 sessionId: session.id,
-                reason: `the "${scope}" approval option is disabled by an admin here — approve once or deny`,
+                reason: recordDisallowsScope
+                  ? `quarantined content can only be released once — approve once or deny`
+                  : `the "${scope}" approval option is disabled by an admin here — approve once or deny`,
                 pendingApprovals: [
                   {
                     requestId: input.approval.requestId,
                     command: p.command,
                     reason: p.reason ?? "requires approval",
                     blocksInput: p.blocksInput !== false,
-                    grantModes: resolution.approvalGrantModes,
+                    grantModes: p.grantModes ?? resolution.approvalGrantModes,
                     ...(p.matched ? { matched: p.matched } : {}),
                     ...(p.purpose ? { purpose: p.purpose } : {}),
                     ...(p.summary ? { summary: p.summary } : {}),
+                    ...(p.summaryDetail ? { summaryDetail: p.summaryDetail } : {}),
                     ...(p.approvalKey ? { approvalKey: p.approvalKey } : {}),
-                    ...(p.kind === "approval" ? { kind: p.kind } : {}),
+                    ...(p.kind ? { kind: p.kind } : {}),
                   },
                 ],
               };
             }
             await pending.delete(input.approval.requestId);
+            if (p.kind === "input") {
+              await deps.sessions
+                .clearSecurityTaint(session.id)
+                .catch(swallowAs("clearSecurityTaint on input approval", false));
+            }
             const useKey = p.approvalKey ?? p.command;
             commandUses.set(useKey, (commandUses.get(useKey) ?? 0) + (scope === "once" ? 1 : Infinity));
             if (scope === "session" || scope === "always") {
@@ -1405,10 +1518,14 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               : "") +
             ". You're acting as them: confirm before any mutation, and say exactly what you changed. Hard limits the API enforces: private-content reads work only from a DM; admin grant changes are portal-only.";
         }
-        if (deps.signingSecret && deps.apiBaseUrl && (deps.crons || deps.monitors)) {
+        if (deps.signingSecret && deps.apiBaseUrl && (deps.crons || deps.webhooks || deps.monitors)) {
           const nowMs = Date.now();
-          const obligations = await Promise.all([deps.crons?.list() ?? [], deps.monitors?.enabled() ?? []])
-            .then(([crons, mons]) =>
+          const obligations = await Promise.all([
+            deps.crons?.list() ?? [],
+            deps.webhooks?.list() ?? [],
+            deps.monitors?.enabled() ?? [],
+          ])
+            .then(([crons, hooks, mons]) =>
               renderStandingObligations(
                 crons.filter(
                   (c) =>
@@ -1419,6 +1536,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                       c.schedule.everyMs != null ||
                       (c.schedule.firstFireAt ?? c.createdAt) > nowMs),
                 ),
+                hooks.filter((w) => w.enabled && w.ownerScopeId === scopeId),
                 mons.filter((m) => m.ownerScopeId === scopeId && m.expiresAt > nowMs),
               ),
             )
@@ -1880,6 +1998,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           },
           ...(deps.config ? { config: deps.config } : {}),
           ...(deps.control && controlClaims ? { control: deps.control, controlClaims } : {}),
+          ...(deps.webhookPublicUrl ? { webhookPublicUrl: deps.webhookPublicUrl } : {}),
           ...(surfaceToolDeps ? { surface: surfaceToolDeps } : {}),
           memory: deps.memory,
           memoryScopeId,
@@ -2212,6 +2331,85 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         const wantsOrgFastMode =
           typeof input.fastMode !== "boolean" && humanTurn && (await deps.config?.getInteractiveFastModeDurable());
         const effectiveFastMode = resolveTurnFastMode(input.fastMode, humanTurn, wantsOrgFastMode === true);
+        let userProviderKeys: ProviderKeys | undefined;
+        let userModelOverride: string | undefined;
+        let userHarnessOverride: string | undefined;
+        let claudeOauthToken: string | undefined;
+        let codexTurnAuth: CodexTurnAuth | undefined;
+        const userCredStore = deps.userModelCredentials;
+        if (userCredStore && humanTurn && (await deps.config?.getIndividualModelAuthDurable())) {
+          const [anthCred, oaiCred] = await Promise.all([
+            userCredStore.get(actor.id, "anthropic"),
+            userCredStore.get(actor.id, "openai"),
+          ]);
+          // The org's harness choice decides how a ChatGPT subscription is
+          // served: pi orgs stay on pi (Codex provider inside pi-ai), others
+          // hop to the codex harness.
+          const orgRuntime = await deps.config?.getRuntimeSelectionDurable(resolution.orgScopeId);
+          const preferredHarness = input.harness ?? orgRuntime?.harnessId ?? deps.defaultHarness;
+          const routing = resolveIndividualAuthRouting(
+            anthCred ?? null,
+            oaiCred ?? null,
+            input.model,
+            preferredHarness,
+          );
+          if (routing?.kind === "apikey") {
+            userHarnessOverride = "pi";
+            userProviderKeys = { [routing.provider]: routing.apiKey };
+            userModelOverride = routing.model;
+          } else if (routing?.kind === "oauth" && routing.provider === "anthropic" && anthCred?.oauth) {
+            // Derived material only — the keychain refreshes centrally
+            // (single-flight, CAS) and the refresh token never leaves it.
+            const derived = await userCredStore.derivedOAuth(actor.id, "anthropic");
+            if (derived) {
+              claudeOauthToken = derived.accessToken;
+              userHarnessOverride = routing.harness;
+              userModelOverride = routing.model;
+            }
+          } else if (
+            routing?.kind === "oauth" &&
+            routing.provider === "openai" &&
+            routing.harness === "pi" &&
+            oaiCred?.oauth
+          ) {
+            // pi-on-ChatGPT: pi-ai's openai-codex provider takes the access
+            // token as its key (the account claim rides inside the JWT).
+            const derived = await userCredStore.derivedOAuth(actor.id, "openai");
+            if (derived) {
+              userProviderKeys = { [CODEX_SUBSCRIPTION_PROVIDER]: derived.accessToken };
+              userHarnessOverride = routing.harness;
+              userModelOverride = routing.model;
+            }
+          } else if (routing?.kind === "oauth" && routing.provider === "openai" && oaiCred?.oauth) {
+            const derived = await userCredStore.derivedOAuth(actor.id, "openai");
+            if (derived?.idToken) {
+              codexTurnAuth = {
+                accessToken: derived.accessToken,
+                idToken: derived.idToken,
+                ...(derived.accountId ? { accountId: derived.accountId } : {}),
+                ...(derived.expiresAt !== undefined ? { expiresAt: derived.expiresAt } : {}),
+              };
+              userHarnessOverride = routing.harness;
+              userModelOverride = routing.model;
+            }
+          }
+          if (!userHarnessOverride) {
+            throw new NonRetryableTurnError(
+              "This organization has each person chat on their own AI account, and yours isn't connected yet. Open the web app and connect Claude or ChatGPT from the AI account panel, then try again.",
+            );
+          }
+        }
+        const effectiveModel = userModelOverride ?? input.model;
+        const effectiveHarness = userHarnessOverride ?? input.harness;
+        if (userHarnessOverride) {
+          let authLabel = "api-key";
+          if (claudeOauthToken) authLabel = "claude-oauth";
+          else if (codexTurnAuth) authLabel = "codex-oauth";
+          else if (userProviderKeys?.[CODEX_SUBSCRIPTION_PROVIDER]) authLabel = "codex-oauth-pi";
+          console.log(
+            `[individual-auth] user=${actor.id} harness=${userHarnessOverride} model=${effectiveModel} auth=${authLabel}`,
+          );
+        }
         const runHarnessTurn = (
           harnessInput: string,
           extras: {
@@ -2236,6 +2434,10 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           }
           return deps.harness.turns.runTurn({
             session,
+            ...(userProviderKeys ? { providerKeys: userProviderKeys } : {}),
+            ...(claudeOauthToken ? { claudeOauthToken } : {}),
+            ...(userHarnessOverride ? { runtimePinned: true } : {}),
+            ...(codexTurnAuth ? { codexAuth: codexTurnAuth } : {}),
             ...(input.runId ? { runId: input.runId } : {}),
             ...(input.cancel ? { cancel: input.cancel } : {}),
             input: harnessInput,
@@ -2246,20 +2448,14 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             ...(extras.overheard?.length ? { overheard: extras.overheard } : {}),
             ...(extras.attachments?.length ? { attachments: extras.attachments } : {}),
             ...(extras.images?.length ? { images: extras.images } : {}),
-            ...(input.harness ? { harness: input.harness } : {}),
-            ...(input.model ? { model: input.model } : {}),
+            ...(effectiveHarness ? { harness: effectiveHarness } : {}),
+            ...(effectiveModel ? { model: effectiveModel } : {}),
             ...(input.thinkingLevel ? { thinkingLevel: input.thinkingLevel } : {}),
             ...(typeof effectiveFastMode === "boolean" ? { fastMode: effectiveFastMode } : {}),
             ...(strictReadOnly ? { readOnly: true } : {}),
-            ...(input.surfaceTools && surfaceToolDeps
-              ? {
-                  surfaceTools: true,
-                  surfaceName:
-                    input.origin.kind === "automation" && input.origin.destination
-                      ? "slack"
-                      : (input.surface ?? "slack"),
-                }
-              : {}),
+            surfaceName:
+              input.origin.kind === "automation" && input.origin.destination ? "slack" : (input.surface ?? "slack"),
+            ...(input.surfaceTools && surfaceToolDeps ? { surfaceTools: true } : {}),
             ...(isPollFire ? { pollFire: true } : {}),
             ...(effectiveTurnWallClockMs !== undefined ? { turnWallClockMs: effectiveTurnWallClockMs } : {}),
             ...(securityPolicy.inboundScreening === "external"
@@ -2289,6 +2485,19 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                         : undefined;
                     if (verdict?.decision === "auto" && !verdict.unscreened) return true;
                     if (verdict?.decision === "strict") {
+                      const releaseKey = `security-screen-release:${toolLabel}`;
+                      if (authorizeCommand(releaseKey)) {
+                        deps.auditLog.record({
+                          at: Date.now(),
+                          principalId: actor.id,
+                          action: "security_posture.tool_result_release",
+                          resource: input.surface ?? "unknown",
+                          scopeLabel: scopeId,
+                          status: "allowed",
+                          detail: JSON.stringify({ reason: "human_release", tool: toolLabel }),
+                        });
+                        return true;
+                      }
                       deps.auditLog.record({
                         at: Date.now(),
                         principalId: actor.id,
@@ -2298,6 +2507,19 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                         status: "refused",
                         detail: JSON.stringify({ reason: "screen_verdict", tool: toolLabel }),
                       });
+                      if (!quarantineReleaseApprovals.some((qa) => qa.approvalKey === releaseKey)) {
+                        quarantineReleaseApprovals.push({
+                          command: `release quarantined ${toolLabel} output`,
+                          reason: verdict.reason
+                            ? `security screen flagged this ${toolLabel} output: ${verdict.reason}`
+                            : `security screen flagged this ${toolLabel} output`,
+                          purpose: `Release the quarantined ${toolLabel} output into the conversation (once), or keep it blocked.`,
+                          summary: `Blocked content preview: ${quarantinePreview(result)}`,
+                          summaryDetail: quarantineFullText(result),
+                          approvalKey: releaseKey,
+                          grantModes: { session: false, always: false },
+                        });
+                      }
                       return false;
                     }
                     deps.auditLog.record({
@@ -2449,9 +2671,9 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               deps.modelGateway.recordCall({ at: Date.now(), scopeLabel: scopeId, ...rec });
               void deps.budget?.record(actor.id, estimateCostUsd(rec.inputTokens));
             },
-            recordLlmRequest: async (rec) => {
+            recordLlmRequest: async (rec, signal) => {
               try {
-                await deps.sessions.recordLlmRequest(session.id, { ...rec, scopeLabel: scopeId });
+                await deps.sessions.recordLlmRequest(session.id, { ...rec, scopeLabel: scopeId }, signal);
               } catch (err) {
                 console.error("[orchestrator] failed to persist LLM request snapshot:", errMessage(err));
               }
@@ -2783,6 +3005,8 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                 actorId: actor.id,
                 ...(automatedTurn ? { autonomous: true } : {}),
                 ...(conversationLabel ? { conversationLabel } : {}),
+                sessionId: session.id,
+                idempotencyKey: input.runId ?? `${session.id}:${spine.turnUserEntrySeq ?? "turn"}`,
               });
             } catch (e) {
               deps.errors?.record({
@@ -2856,7 +3080,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         const sourceAssistantEntrySeq = [...emittedEntries].reverse().find((e) => e.type === "assistant")?.seq;
         if (isPollFire && result.silent && result.pausedOnApproval !== true) {
           finalResult = { status: "silent", sessionId: session.id };
-        } else if (result.pendingApprovals?.length) {
+        } else if (result.pendingApprovals?.length || quarantineReleaseApprovals.length) {
           const approvals: PendingApproval[] = [];
           const grantModesField =
             resolution.approvalGrantModes.session && resolution.approvalGrantModes.always
@@ -2864,11 +3088,18 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               : { grantModes: resolution.approvalGrantModes };
           const request = replayableRequest(input);
           const prepared: Array<{ requestId: string; record: PendingApprovalRecord; approval: PendingApproval }> = [];
-          for (const pa of result.pendingApprovals) {
+          const turnApprovals: Array<
+            NonNullable<HarnessTurnResult["pendingApprovals"]>[number] & {
+              summary?: string;
+              summaryDetail?: string;
+              grantModes?: { session: boolean; always: boolean };
+            }
+          > = [...(result.pendingApprovals ?? []), ...quarantineReleaseApprovals];
+          for (const pa of turnApprovals) {
             const blocks = approvalBlocksInput(pa.kind, outcome);
             const command = pa.command;
             const requestId = commandApprovalId(session.id, command);
-            const summary = await approvalSummary(scopeId, command, pa.reason, pa.purpose);
+            const summary = pa.summary ?? (await approvalSummary(scopeId, command, pa.reason, pa.purpose));
             prepared.push({
               requestId,
               record: {
@@ -2878,10 +3109,11 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                 reason: pa.reason,
                 request,
                 blocksInput: blocks,
-                ...grantModesField,
+                ...(pa.grantModes ? { grantModes: pa.grantModes } : grantModesField),
                 ...(pa.matched ? { matched: pa.matched } : {}),
                 ...(pa.purpose ? { purpose: pa.purpose } : {}),
                 ...(summary ? { summary } : {}),
+                ...(pa.summaryDetail ? { summaryDetail: pa.summaryDetail } : {}),
                 ...(pa.approvalKey ? { approvalKey: pa.approvalKey } : {}),
                 ...(pa.kind ? { kind: pa.kind } : {}),
               },
@@ -2890,10 +3122,11 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                 command,
                 reason: pa.reason,
                 blocksInput: blocks,
-                ...grantModesField,
+                ...(pa.grantModes ? { grantModes: pa.grantModes } : grantModesField),
                 ...(pa.matched ? { matched: pa.matched } : {}),
                 ...(pa.purpose ? { purpose: pa.purpose } : {}),
                 ...(summary ? { summary } : {}),
+                ...(pa.summaryDetail ? { summaryDetail: pa.summaryDetail } : {}),
                 ...(pa.approvalKey ? { approvalKey: pa.approvalKey } : {}),
                 ...(pa.kind ? { kind: pa.kind } : {}),
               },
@@ -2994,6 +3227,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             ...(err.matched ? { matched: err.matched } : {}),
             ...(summary ? { summary } : {}),
             ...(err.approvalKey ? { approvalKey: err.approvalKey } : {}),
+            ...(err.kind ? { kind: err.kind } : {}),
             blocksInput: true,
           };
           return { status: "pending_approval", sessionId: session.id, pendingApprovals: [approval] };

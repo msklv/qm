@@ -19,6 +19,7 @@ import { errMessage } from "../../util/errors.ts";
 import { renderAgentApis } from "../agent-api-catalog.ts";
 import { mintCapabilityToken, CAPABILITY_TTL_MS } from "../../auth/capability-token.ts";
 import { contentTypeWithUtf8Charset, pipeToResponse, sendJson } from "../http.ts";
+import { resolveBranding } from "../../resolution/branding.ts";
 import { audit, isObj, orgScope } from "./shared.ts";
 import {
   UI_STATE_KEY_PATTERN,
@@ -27,6 +28,7 @@ import {
   storeUiState,
   uiStateId,
 } from "../../surfaces/ui-state.ts";
+import { redactWebhook } from "./webhooks.ts";
 import { type ApiCtx, type Route } from "./route.ts";
 import {
   ARTIFACT_TYPES,
@@ -489,6 +491,7 @@ async function listScopeResources(ctx: ApiCtx): Promise<void> {
   return sendJson(res, 200, {
     files: out.files,
     crons: out.crons,
+    webhooks: out.webhooks.map(redactWebhook),
     deployments: out.deployments,
     skills: out.skills,
     manageable: out.manageable,
@@ -670,7 +673,9 @@ async function agentMemory(ctx: ApiCtx): Promise<void> {
     const results: Array<{ scopeId: string; fact: string }> = [];
     for (const scope of scopes) {
       if (results.length >= limit) break;
-      for (const fact of await deps.memory.query(scope, b.query, limit - results.length)) {
+      for (const fact of await deps.memory.query(scope, b.query, limit - results.length, {
+        actorId: capability.actorId,
+      })) {
         results.push({ scopeId: scope, fact });
       }
     }
@@ -704,7 +709,10 @@ async function agentMemory(ctx: ApiCtx): Promise<void> {
   if (method === "POST" && pathname === "/v1/memory/facts") {
     const facts = parseFacts(body);
     if (typeof facts === "string") return sendJson(res, 400, { error: "bad_request", message: facts });
-    const added = await deps.memory.capture(write, facts, Date.now(), capability.actorId);
+    const added = await deps.memory.capture(write, facts, Date.now(), capability.actorId, {
+      mode: "explicit",
+      actorId: capability.actorId,
+    });
     audit(deps, {
       principalId: capability.actorId,
       action: "memory.agent.capture",
@@ -1055,10 +1063,12 @@ async function getSurfaceConfig(ctx: ApiCtx): Promise<void> {
     deps.config.getWebuiModelsDurable(orgScope(deps)),
     deps.config.getBaseModelDurable(orgScope(deps)),
     deps.config.getExternalSlackParticipantsDurable(orgScope(deps)),
-    deps.config.getBrandingDurable(orgScope(deps)),
+    resolveBranding(deps.config, orgScope(deps), deps.brandingDefault),
   ]);
   const harnessId = deps.harnessId ?? "pi";
   const managedKeys = deps.modelCredentials ? await deps.modelCredentials.availability() : null;
+  const configuredKeys = deps.providerKeys ?? managedKeys;
+  const providerStatus = harnessId === "pi" && managedKeys ? managedKeys : configuredKeys;
   const catalog = managedKeys?.openrouter
     ? await selectableModelCatalog(deps.modelCredentialFetch)
     : builtInModelCatalog();
@@ -1067,32 +1077,18 @@ async function getSurfaceConfig(ctx: ApiCtx): Promise<void> {
   const resolvedBase = modelSupportedByHarness(baseModel ?? undefined, harnessId)
     ? baseModel!
     : defaultModelForHarness(harnessId, deps.baseModelDefault);
-  const dflt = deps.brandingDefault;
-  const pick = (a: unknown, b: unknown): string | undefined => {
-    if (typeof a === "string") return a;
-    return typeof b === "string" ? b : undefined;
-  };
-  const rawAccent = pick(branding?.accent, dflt?.accent);
-  const accent =
-    rawAccent && /^#([0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(rawAccent) ? rawAccent : undefined;
-  const mark =
-    pick(branding?.mark, dflt?.mark)
-      ?.replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029"\\<>{}]/g, "")
-      .slice(0, 2) || undefined;
-  const selfLabel =
-    pick(branding?.selfLabel, dflt?.selfLabel)
-      ?.replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/g, "")
-      .slice(0, 40) || undefined;
   const resolvedBranding = {
-    ...(accent ? { accent } : {}),
-    ...(mark ? { mark } : {}),
-    ...(selfLabel ? { selfLabel } : {}),
+    ...(branding.accent ? { accent: branding.accent } : {}),
+    ...(branding.mark ? { mark: branding.mark } : {}),
+    ...(branding.selfLabel ? { selfLabel: branding.selfLabel } : {}),
   };
   return sendJson(res, 200, {
     webuiModels: configuredPicker.length ? configuredPicker : allowed,
     baseModel: resolvedBase,
     harnessId,
-    ...(managedKeys ? { modelProviderConfigured: Object.values(managedKeys).some(Boolean) } : {}),
+    ...(providerStatus && {
+      modelProviderConfigured: Object.values(providerStatus).some(Boolean) || Boolean(deps.harnessCarriedModelAuth),
+    }),
     externalSlackParticipants,
     ...(Object.keys(resolvedBranding).length ? { branding: resolvedBranding } : {}),
   });

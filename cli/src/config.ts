@@ -45,7 +45,7 @@ export interface PluginEntry {
 }
 
 export interface SandboxConfig {
-  backend?: "sprites" | "aws";
+  backend?: "local" | "sprites" | "aws" | "agent37";
   app?: string;
   image?: string;
   baseImage?: string;
@@ -152,6 +152,8 @@ export interface QmConfig {
   vms?: Partial<Record<ServiceName, { size?: string; memory?: string }>>;
   imageOverrides: Partial<Record<ServiceName, string>>;
   sandbox?: SandboxConfig;
+  botName?: string;
+  orgName?: string;
   appPrefix?: string;
   region?: string;
   flyOrg?: string;
@@ -203,10 +205,14 @@ export const isDigestPinned = (ref: string): boolean => /@sha256:[0-9a-f]{64}$/.
 
 const SANDBOX_PIN_PENDING = `"sandbox.app" is set but no sandbox layer image is pinned; run \`qm sandbox publish\` to build and record the digest-pinned "sandbox.image" agents boot from`;
 
+export const localSandboxActive = (config: QmConfig): boolean =>
+  config.target === "docker" && config.sandbox?.backend === "local";
+
 export const sandboxPinPending = (config: QmConfig): boolean =>
-  config.target !== "aws" && Boolean(config.sandbox?.app && !config.sandbox.image);
+  config.target !== "aws" && !localSandboxActive(config) && Boolean(config.sandbox?.app && !config.sandbox.image);
 
 export function sandboxImagePinErrors(config: QmConfig): Array<{ clause: string; message: string }> {
+  if (localSandboxActive(config)) return [];
   const sb = config.sandbox;
   if (!sb?.app || !sb.image || isDigestPinned(sb.image)) return [];
   return [
@@ -225,6 +231,15 @@ export function sandboxCoreEnv(
   const missingSecrets: string[] = [];
   const sb = config.sandbox;
   if (!sb) return { env, missingSecrets };
+  if (localSandboxActive(config)) {
+    env.SANDBOX_BACKEND = "local";
+    if (sb.image) env.LOCAL_SANDBOX_IMAGE = sb.image;
+    return { env, missingSecrets };
+  }
+  if (sb.backend === "agent37") {
+    env.SANDBOX_BACKEND = "agent37";
+    return { env, missingSecrets };
+  }
   if (sb.app) {
     if (!sb.image) throw new CliError(SANDBOX_PIN_PENDING, { clause: "config.v1" });
     const violation = sandboxImagePinErrors(config)[0];
@@ -502,6 +517,8 @@ const VALID_TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
   "vms",
   "imageOverrides",
   "sandbox",
+  "botName",
+  "orgName",
   "appPrefix",
   "region",
   "flyOrg",
@@ -708,6 +725,24 @@ function validate(raw: unknown, path: string): QmConfig {
     }
     out.basePort = bp;
   }
+  const identityName = (key: "botName" | "orgName", cap: number, what: string): string | undefined => {
+    if (o[key] === undefined) return undefined;
+    const name = typeof o[key] === "string" ? o[key].trim() : "";
+    if (!name || name.length > cap || /[<>{}\u0000-\u001F\u007F-\u009F\u2028\u2029"\\]/.test(name)) {
+      throw new CliError(
+        `${path}: "${key}" must be a nonempty string of at most ${cap} characters without <>{}, quotes, backslashes, or control characters — ${what}`,
+      );
+    }
+    return name;
+  };
+  const botName = identityName(
+    "botName",
+    31,
+    'it names the bot everywhere users see it: the Slack apps (including the "<botName> SSO" sign-in app, which Slack caps at 35 characters), the prompt identity, and sign-in pages',
+  );
+  if (botName) out.botName = botName;
+  const orgName = identityName("orgName", 40, "it is how the bot refers to your organization");
+  if (orgName) out.orgName = orgName;
   if (typeof o["appPrefix"] === "string") out.appPrefix = o["appPrefix"];
   if (typeof o["region"] === "string") out.region = o["region"];
   if (typeof o["flyOrg"] === "string") out.flyOrg = o["flyOrg"];
@@ -1304,9 +1339,14 @@ function validateSandbox(raw: unknown, path: string, target: Target): SandboxCon
   };
   const out: SandboxConfig = {};
   if (o["backend"] !== undefined) {
-    if (o["backend"] !== "sprites" && o["backend"] !== "aws") {
+    if (
+      o["backend"] !== "local" &&
+      o["backend"] !== "sprites" &&
+      o["backend"] !== "aws" &&
+      o["backend"] !== "agent37"
+    ) {
       throw new CliError(
-        `${path}: "sandbox.backend" must be "sprites" (Fly Sprites, booting the operator-published layer image from the Fly app in "sandbox.app") or "aws" (Lambda MicroVM sandboxes)`,
+        `${path}: "sandbox.backend" must be "local" (Docker containers on the deployment host), "sprites" (Fly Sprites), "aws" (Lambda MicroVM sandboxes), or "agent37"`,
       );
     }
     out.backend = o["backend"];
@@ -1348,6 +1388,14 @@ function validateSandbox(raw: unknown, path: string, target: Target): SandboxCon
     const label = out.backend === "aws" ? " (Lambda MicroVM sandboxes)" : "";
     throw new CliError(`${path}: "sandbox.backend": ${JSON.stringify(out.backend)}${label} requires target ${targets}`);
   }
+  if (out.backend === "local") {
+    const stray = (["app", "baseImage", "env", "secretEnv"] as const).filter((key) => out[key] !== undefined);
+    if (stray.length) {
+      throw new CliError(
+        `${path}: "sandbox.backend": "local" ignores ${stray.map((key) => `"sandbox.${key}"`).join(", ")} — remove them; use "sandbox.image" for the runnable local sandbox image`,
+      );
+    }
+  }
   if (out.backend === "aws") {
     const stray = (["app", "image", "baseImage", "env", "secretEnv"] as const).filter((key) => out[key] !== undefined);
     if (stray.length) {
@@ -1356,8 +1404,16 @@ function validateSandbox(raw: unknown, path: string, target: Target): SandboxCon
       );
     }
   }
-  if (out.image && !out.app) {
-    throw new CliError(`${path}: "sandbox.image" requires "sandbox.app" (the app the microVMs run in)`);
+  if (out.backend === "agent37") {
+    const stray = (["app", "image", "baseImage", "env", "secretEnv"] as const).filter((key) => out[key] !== undefined);
+    if (stray.length) {
+      throw new CliError(
+        `${path}: "sandbox.backend": "agent37" ignores ${stray.map((key) => `"sandbox.${key}"`).join(", ")} — remove them`,
+      );
+    }
+  }
+  if (out.image && !out.app && out.backend !== "local") {
+    throw new CliError(`${path}: "sandbox.image" requires "sandbox.app" unless "sandbox.backend" is "local"`);
   }
   if (out.backend === "sprites" && !out.app) {
     throw new CliError(

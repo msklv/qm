@@ -4,6 +4,15 @@ A multiplayer agent harness for work. In Slack and on the web.
 
 ![The QM web UI: two concurrent sessions, a sidebar of personal files, crons, keychain, deploys, memory, and skills](./docs/screenshots/web-ui-hero.png)
 
+## Setup
+
+Tell your coding agent of choice `Let's deploy https://github.com/yc-software/qm`. From here, it should follow the deployment guide in this repo.
+
+Administrators can try a deployment before configuring email: run `qm admin-login`
+with its configuration and secrets, then open the five-minute, single-use link.
+Configure email delivery later for ordinary email sign-in and invitation emails.
+See the [CLI instructions](cli/README.md#administrator-login-without-email).
+
 ## What is QM?
 
 Most agents are designed like personal assistants. You can make one work for a whole
@@ -29,7 +38,8 @@ isn't tied to any single vendor.
 - **Web apps.** Spin up custom internal apps and publish them to the right people.
 - **Shared skills.** Skills are scope-owned and shareable by grant, with admin-gated
   promotion to the whole org and skill packs imported from git repositories.
-- **Background work.** Crons and watches run work while nobody's watching.
+- **Background work.** Crons, watches, and inbound webhooks run work while nobody's
+  watching.
 
 ## What you can do with it
 
@@ -74,8 +84,8 @@ uses Bolt; the web UI builds with Vite and renders with Lit.
 The core itself is generic. Everything specific to one company — org config, custom tools
 and skills, sandbox image, infrastructure — lives in a **deployment directory** that the
 [`qm` CLI](./cli/README.md) validates and deploys. Every substrate (harness, session
-store, sandbox, memory) sits behind an interface, so production implementations swap in
-via one wiring file.
+store, sandbox, memory) sits behind an interface. Memory can also be routed by scope to
+[external providers](./docs/memory-providers.md) while retaining the built-in notebook.
 
 ## Security and secrets
 
@@ -171,6 +181,7 @@ messages, and screenshots for organization identifiers before it pushes. Nothing
 - [`docs/getting-started.md`](./docs/getting-started.md) — first run, end to end
 - [`cli/README.md`](./cli/README.md) — the `qm` CLI and the deployment directory contract
 - [`docs/deploy-directory.md`](./docs/deploy-directory.md) — the deployment directory in full
+- [`docs/porter.md`](./docs/porter.md) — running qm on Porter
 - [`.env.example`](./.env.example) — every knob, documented in place
 - [`plugins/`](./plugins) — the surfaces (Slack, web UI, admin, portal)
 

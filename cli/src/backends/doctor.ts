@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   MODEL_PROVIDER_KEYS,
+  localSandboxActive,
   mockHarnessWarning,
   validatePortalTrust,
   type ModelProvider,
@@ -9,7 +10,8 @@ import {
 } from "../config.ts";
 import { CliError, errMessage, step, warn } from "../log.ts";
 import { capture, deploymentSecretValue, flyBin, isInvalidSecret, readEnvFile, which } from "../util.ts";
-import { computedSecrets } from "../secrets.ts";
+import { computedSecrets, serviceSecretValue } from "../secrets.ts";
+import { emailTransportConfigured } from "../preflight.ts";
 
 export function slackManifestBotScopes(manifest: string): string[] {
   try {
@@ -143,7 +145,9 @@ export async function doctorCommon(
       );
     step("required local secret values: ok");
   }
-  if (config.target === "aws") {
+  if (localSandboxActive(config)) {
+    step("local Docker sandbox: configured");
+  } else if (config.target === "aws") {
     step("AWS Lambda MicroVM sandbox: configured");
   } else if (config.sandbox?.app) {
     requireFlyAuth();
@@ -280,8 +284,13 @@ async function smtpReachable(host: string, port: number): Promise<string> {
 }
 
 async function authBrokerCheck(config: QmConfig, secrets: Map<string, string>, haveValues: boolean): Promise<void> {
+  if (haveValues && !emailTransportConfigured(config, secrets)) {
+    step("sign-in email: disabled; use qm admin-login for administrator access");
+    return;
+  }
   const transport = config.env.auth?.AUTH_EMAIL_TRANSPORT?.trim() === "smtp" ? "smtp" : "resend";
-  const sender = deploymentSecretValue("AUTH_EMAIL_FROM", secrets.get("AUTH_EMAIL_FROM"));
+  const value = (name: string): string | undefined => serviceSecretValue(config, "auth", name, secrets);
+  const sender = value("AUTH_EMAIL_FROM");
   if (haveValues) {
     const address = (/<([^>]+)>\s*$/.exec((sender ?? "").trim())?.[1] ?? sender ?? "").trim();
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(address)) {
@@ -292,7 +301,7 @@ async function authBrokerCheck(config: QmConfig, secrets: Map<string, string>, h
     step(`sign-in links send from ${address}`);
   }
   if (transport === "resend") {
-    const key = deploymentSecretValue("RESEND_API_KEY", secrets.get("RESEND_API_KEY"));
+    const key = value("RESEND_API_KEY");
     if (!key) {
       warn("RESEND_API_KEY is not available locally — skipping the live Resend check");
       return;
@@ -301,7 +310,7 @@ async function authBrokerCheck(config: QmConfig, secrets: Map<string, string>, h
     step("Resend API key: ok (verify the sending domain under https://resend.com/domains)");
     return;
   }
-  const host = deploymentSecretValue("SMTP_HOST", secrets.get("SMTP_HOST"));
+  const host = value("SMTP_HOST");
   if (!host) {
     warn("SMTP_HOST is not available locally — skipping the live SMTP reachability check");
     return;

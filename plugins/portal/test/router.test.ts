@@ -206,6 +206,30 @@ test("CSRF: a non-GET without a same-origin Origin is refused", async () => {
   assert.equal(sameOrigin.status, 200);
 });
 
+test("inbound webhooks pass through to the core with NO session, signature headers preserved, no synthesized cookie", async () => {
+  const r = await fetch(`${base}/v1/webhooks/incoming/wh_abc?x=1`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-hub-signature-256": "sha256=deadbeef",
+      "x-github-delivery": "d-1",
+    },
+    body: JSON.stringify({ hello: "world" }),
+  });
+  assert.equal(r.status, 200);
+  const body = (await r.json()) as { url: string; cookie: string | null; headers: Record<string, string> };
+  assert.equal(body.url, "/v1/webhooks/incoming/wh_abc?x=1");
+  assert.equal(body.cookie, null);
+  assert.equal(body.headers["x-hub-signature-256"], "sha256=deadbeef");
+  assert.equal(body.headers["x-github-delivery"], "d-1");
+});
+
+test("the webhook passthrough is exact-shape + POST-only (no widening of /v1)", async () => {
+  assert.equal((await fetch(`${base}/v1/webhooks/incoming/abc`)).status, 404);
+  assert.equal((await fetch(`${base}/v1/webhooks/incoming/a/b`, { method: "POST" })).status, 404);
+  assert.equal((await fetch(`${base}/v1/webhooks`, { method: "POST" })).status, 404);
+});
+
 test("the provider callback still passes through publicly with NO session/cookie", async () => {
   const cb = await fetch(`${base}/v1/connectors/oauth/google/callback?code=c&state=s`, { redirect: "manual" });
   assert.equal(cb.status, 200);
@@ -309,9 +333,9 @@ test("new human path /drop/:id: form GET reaches the core /v1 drop form with x-d
   assert.equal(ob.headers["x-drop-owner"], "owner@acme");
 });
 
-test("deployments are OFF by default (404 even with a session)", async () => {
+test("deployments are ON by default — /d/ proxies to core for a signed-in session", async () => {
   const r = await fetch(`${base}/d/some-app/`, { headers: { cookie: sessionCookie("U1") } });
-  assert.equal(r.status, 404);
+  assert.notEqual(r.status, 404, "the /d/ route exists without PORTAL_DEPLOYMENTS_ENABLED");
 });
 
 test("auth/login sets the tmp cookie and 302s to the IdP with PKCE+state+nonce", async () => {

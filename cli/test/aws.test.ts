@@ -470,6 +470,15 @@ test("AWS environment derives identity, public URLs, private wiring, and MicroVM
   assert.equal(core.PORT, "8080");
 });
 
+test("a configured bot identity lands in the AWS core task env and only there", () => {
+  const branded = { ...config, botName: "straylight", orgName: "Straylight Industries" };
+  const core = serviceEnvironment(branded, "core");
+  assert.equal(core.ORG_BRAND_SELF_LABEL, "straylight");
+  assert.equal(core.ORG_BRAND_ORG_NAME, "Straylight Industries");
+  assert.equal(serviceEnvironment(branded, "web-ui").ORG_BRAND_SELF_LABEL, undefined);
+  assert.equal(serviceEnvironment(config, "core").ORG_BRAND_SELF_LABEL, undefined);
+});
+
 test("AWS routes security screen proxy configuration and its token only to core", () => {
   const screened: QmConfig = {
     ...config,
@@ -988,7 +997,7 @@ test("AWS portal ALB adopts pinned target groups and requires exactly the env-de
     await run(
       hostSplitConfig({ appsDomain: "*.apps.agent.acme.example" }),
       undefined,
-      /env\.core\.AWS_DEPLOY_APPS_DOMAIN .* does not derive a valid ALB host-header hostname/,
+      /env\.core\.DEPLOY_APPS_DOMAIN or AWS_DEPLOY_APPS_DOMAIN.* does not derive a valid ALB host-header hostname/,
     );
     await run(
       hostSplitConfig(bothHosts),
@@ -4218,6 +4227,14 @@ test("env.core.SANDBOX_BACKEND adopts the deployment's substrate; the default is
     env: { ...config.env, core: { ...config.env.core, SANDBOX_BACKEND: "sprites" } },
   };
   assert.equal(serviceEnvironment(adopted, "core").SANDBOX_BACKEND, "sprites");
+  const agent37: QmConfig = {
+    ...config,
+    sandbox: undefined,
+    env: { ...config.env, core: { ...config.env.core, SANDBOX_BACKEND: "agent37" } },
+  };
+  const agent37Env = serviceEnvironment(agent37, "core");
+  assert.equal(agent37Env.SANDBOX_BACKEND, "agent37");
+  assert.equal(agent37Env.AWS_SANDBOX_IMAGE, undefined);
 });
 
 test("env.core.S3_BUCKET adopts a pre-existing snapshot bucket; the derived object store remains the default", () => {

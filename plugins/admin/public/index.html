@@ -209,9 +209,6 @@
         grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
         min-height: calc(100dvh - var(--header-total-h));
       }
-      .admin-app.hidden {
-        display: none;
-      }
       .admin-sidebar {
         position: sticky;
         top: var(--header-total-h);
@@ -476,6 +473,8 @@
         margin: 0 0 6px;
       }
       input[type="text"],
+      input[type="email"],
+      input[type="date"],
       input[type="password"],
       input[type="number"],
       textarea,
@@ -689,9 +688,6 @@
         border-radius: var(--radius);
         background: var(--surface);
         box-shadow: 0 12px 32px rgba(16, 24, 40, 0.12);
-      }
-      .scope-menu.hidden {
-        display: none;
       }
       .scope-menu .scope-filter {
         padding: 8px;
@@ -1073,9 +1069,6 @@
         flex-wrap: wrap;
         margin: 0 0 10px;
       }
-      .pack-adv.hidden {
-        display: none;
-      }
       .pack-adv input {
         flex: 1 1 150px;
         min-width: 0;
@@ -1126,9 +1119,6 @@
         border: 1px solid var(--border);
         border-radius: 8px;
         box-shadow: 0 8px 24px rgba(16, 24, 40, 0.12);
-      }
-      .ovmenu.hidden {
-        display: none;
       }
       .ovmenu button {
         text-align: left;
@@ -1187,9 +1177,6 @@
       .dense-row .file-thumb {
         width: 36px;
         height: 28px;
-      }
-      .dense-row.hidden {
-        display: none;
       }
       .scope-link {
         border: 0;
@@ -1364,7 +1351,7 @@
         font-variant-numeric: tabular-nums;
       }
       .hidden {
-        display: none;
+        display: none !important;
       }
 
       tr.openable {
@@ -3126,9 +3113,6 @@
       #view-governance section.card.setting-row {
         padding: 12px 14px;
       }
-      #view-governance .setting-row.hidden {
-        display: none;
-      }
       #view-governance .setting-row > .head {
         display: block;
         margin: 0;
@@ -3862,7 +3846,7 @@
               <p class="governance-eyebrow">Temporary setup guide</p>
               <h1>Onboarding</h1>
               <p class="lead">
-                Get this QM instance ready for real conversations. Secrets are validated, encrypted in durable storage,
+                Get this deployment ready for real conversations. Secrets are validated, encrypted in durable storage,
                 and never displayed again.
               </p>
             </div>
@@ -3870,13 +3854,13 @@
               <section class="setup-step">
                 <span class="badge muted" id="onboarding-model-badge">Not ready</span>
                 <h2>1. Model provider</h2>
-                <p id="onboarding-model-summary">Add the key QM will use for its base model.</p>
+                <p id="onboarding-model-summary">Add the key the agent will use for its base model.</p>
               </section>
               <section class="setup-step">
                 <span class="badge muted" id="onboarding-slack-badge">Optional</span>
                 <h2>2. Slack app</h2>
                 <p id="onboarding-slack-summary">
-                  Create the QM app, install it, then add its bot and Socket Mode tokens.
+                  Create the Slack app, install it, then add its bot and Socket Mode tokens.
                 </p>
                 <div class="foot">
                   <a
@@ -3885,7 +3869,7 @@
                     href="https://api.slack.com/apps?new_app=1"
                     target="_blank"
                     rel="noopener noreferrer"
-                    >Create QM Slack app ↗</a
+                    >Create Slack app ↗</a
                   >
                   <button type="button" data-onboarding-target="slack">Enter Slack tokens</button>
                 </div>
@@ -3933,8 +3917,9 @@
               <div class="head">
                 <h2>Custom providers</h2>
                 <p>
-                  Point QM at any OpenAI- or Anthropic-compatible endpoint — a vendor like DeepSeek, or a gateway like
-                  LiteLLM fronting many models. Keys are validated, stored write-only, and the models join the picker.
+                  Point the deployment at any OpenAI- or Anthropic-compatible endpoint — a vendor like DeepSeek, or a
+                  gateway like LiteLLM fronting many models. Keys are validated, stored write-only, and the models join
+                  the picker.
                 </p>
               </div>
               <div class="body">
@@ -4074,6 +4059,52 @@
                   <div class="foot">
                     <button class="primary" data-save="security-posture">Apply</button
                     ><span class="status" id="st-security-posture"></span>
+                  </div>
+                </section>
+                <section class="card hidden" id="card-auto-flagger">
+                  <div class="head">
+                    <h2>Auto flagger</h2>
+                    <p>
+                      Model and classification rubric used to screen external context and tool results in Auto mode. The
+                      security boundary and required verdict format remain fixed.
+                    </p>
+                  </div>
+                  <div class="body">
+                    <label for="auto-flagger-harness">Harness</label>
+                    <select id="auto-flagger-harness" style="max-width: 360px"></select>
+                    <label for="auto-flagger-model">Model</label>
+                    <select id="auto-flagger-model" style="max-width: 440px"></select>
+                    <label for="auto-flagger-rubric">Classification rubric</label>
+                    <textarea id="auto-flagger-rubric" rows="10" style="width: 100%"></textarea>
+                  </div>
+                  <div class="foot">
+                    <button class="primary" data-save="auto-flagger">Apply</button>
+                    <button id="auto-flagger-test" type="button">Test</button>
+                    <label
+                      for="auto-flagger-window"
+                      style="display: inline-flex; align-items: center; gap: 6px; margin: 0; font-size: 13px"
+                      >on the last
+                      <input
+                        id="auto-flagger-window"
+                        type="number"
+                        min="1"
+                        max="500"
+                        step="1"
+                        value="100"
+                        style="width: 78px"
+                      />
+                      screenings</label
+                    >
+                    <label
+                      style="display: inline-flex; align-items: center; gap: 6px; margin: 0; font-size: 13px"
+                      title="Also replay the configuration in effect today, so the flag rates are comparable"
+                      ><input type="checkbox" id="auto-flagger-compare" /> compare with current</label
+                    >
+                    <button id="auto-flagger-reset" type="button">Restore default</button>
+                    <span class="status" id="st-auto-flagger"></span>
+                  </div>
+                  <div class="foot" id="auto-flagger-test-result" hidden>
+                    <span class="status" id="st-auto-flagger-test"></span>
                   </div>
                 </section>
                 <section class="card setting-row hidden" id="card-approval-grant-modes">
@@ -4396,6 +4427,30 @@
                     ><span class="status" id="st-interactive-fast-mode"></span>
                   </div>
                 </section>
+                <section class="card setting-row hidden" id="card-individual-model-auth">
+                  <div class="head">
+                    <h2>Individual authorization for AI usage</h2>
+                    <p>
+                      Org-wide, default off. When on, each user must connect their own Claude or Codex account (API key
+                      or subscription login) before using the assistant. The org's shared model credentials are not used
+                      for their turns.
+                    </p>
+                  </div>
+                  <div class="body">
+                    <label class="setting-toggle">
+                      <input type="checkbox" id="individual-model-auth" />
+                      <span class="setting-switch" aria-hidden="true"></span>
+                      <span class="setting-copy"
+                        ><strong>Require each user to connect their own model account</strong
+                        ><small>New users are prompted to sign in with Claude or Codex on first use.</small></span
+                      >
+                    </label>
+                  </div>
+                  <div class="foot">
+                    <button class="primary" data-save="individual-model-auth">Apply</button
+                    ><span class="status" id="st-individual-model-auth"></span>
+                  </div>
+                </section>
                 <section class="card setting-row hidden" id="card-base-model">
                   <div class="head">
                     <h2>Default harness and model</h2>
@@ -4456,8 +4511,9 @@
                     <h2>Branding</h2>
                     <p>
                       How this org's surfaces look. Accent is the highlight color across the web UI, admin, and portal;
-                      mark is the 1–2 character badge in the web UI; label is the assistant's name in transcripts. Leave
-                      a field blank to use the deployment default.
+                      mark is the 1–2 character badge in the web UI; label is the assistant's name everywhere it
+                      introduces itself; organization name is how the assistant refers to this org. Leave a field blank
+                      to use the deployment default.
                     </p>
                   </div>
                   <div class="body">
@@ -4472,6 +4528,14 @@
                       style="max-width: 320px"
                       maxlength="40"
                       placeholder="Agent"
+                    />
+                    <label for="branding-org-name" style="margin-top: 12px">Organization name</label>
+                    <input
+                      type="text"
+                      id="branding-org-name"
+                      style="max-width: 320px"
+                      maxlength="40"
+                      placeholder="Acme Corp"
                     />
                   </div>
                   <div class="foot">
@@ -4499,6 +4563,30 @@
                   <div class="foot">
                     <button class="primary" data-save="people-directory-url">Apply</button
                     ><span class="status" id="st-people-directory-url"></span>
+                  </div>
+                </section>
+                <section class="card hidden" id="card-ack-emoji">
+                  <div class="head">
+                    <h2>Slack ack emoji</h2>
+                    <p>
+                      The emoji the bot may react with to acknowledge a Slack message, org-wide. Add names from the
+                      workspace's emoji (custom and standard). Remove every chip to restore the built-in rotation.
+                    </p>
+                  </div>
+                  <div class="body">
+                    <div id="ack-emoji-chips" style="display: flex; flex-wrap: wrap; gap: 6px; align-items: center">
+                      <input
+                        id="ack-emoji-add"
+                        list="ack-emoji-catalog"
+                        placeholder="+ Add emoji"
+                        style="max-width: 240px"
+                      />
+                      <datalist id="ack-emoji-catalog"></datalist>
+                    </div>
+                  </div>
+                  <div class="foot">
+                    <button class="primary" data-save="ack-emoji">Save</button
+                    ><span class="status" id="st-ack-emoji"></span>
                   </div>
                 </section>
                 <section class="card setting-row hidden" id="card-browse-model">
@@ -4821,7 +4909,7 @@
                     href="https://api.slack.com/apps?new_app=1"
                     target="_blank"
                     rel="noopener noreferrer"
-                    >Create QM Slack app from manifest ↗</a
+                    >Create Slack app from manifest ↗</a
                   >
                 </p>
                 <p class="hint" id="slack-installation-state">Not configured.</p>
@@ -4953,6 +5041,9 @@
       let memDraftScope = null;
       let cronDestinationEditId = null;
       let webuiModelIds = [];
+      let ackEmojiNames = [];
+      let ackEmojiCatalog = {};
+      let ackEmojiCatalogLoaded = false;
       const transcriptVisibility = { thinking: true, toolResults: true };
 
       const API_BASE = "__ADMIN_BASE__";
@@ -6340,6 +6431,38 @@
         const showSecurityPosture = "securityPosture" in (r.data || {});
         $("card-security-posture").classList.toggle("hidden", !showSecurityPosture);
         if (showSecurityPosture) $("security-posture").value = r.data.securityPosture || "auto";
+        const showAutoFlagger = scope.startsWith("org:") && "autoFlagger" in (r.data || {});
+        $("card-auto-flagger").classList.toggle("hidden", !showAutoFlagger);
+        if (showAutoFlagger) {
+          const current = r.data.autoFlagger || r.data.autoFlaggerDefault;
+          const harness = $("auto-flagger-harness");
+          const model = $("auto-flagger-model");
+          const harnessOptions = r.data.harnessOptions || [];
+          const modelsByHarness = r.data.modelsByHarness || {};
+          harness.textContent = "";
+          harnessOptions.forEach((id) => {
+            const option = document.createElement("option");
+            option.value = id;
+            option.textContent = { pi: "Pi", opencode: "OpenCode", codex: "Codex", claude: "Claude Code" }[id] || id;
+            harness.appendChild(option);
+          });
+          harness.value = current.harnessId;
+          const syncAutoFlaggerModels = () => {
+            const options = modelsByHarness[harness.value] || [];
+            const prior = model.value || current.modelId;
+            model.textContent = "";
+            options.forEach((entry) => {
+              const option = document.createElement("option");
+              option.value = entry.id;
+              option.textContent = entry.name + " (" + entry.id + ")";
+              model.appendChild(option);
+            });
+            model.value = options.some((entry) => entry.id === prior) ? prior : (options[0] || {}).id || "";
+          };
+          harness.oninput = syncAutoFlaggerModels;
+          syncAutoFlaggerModels();
+          $("auto-flagger-rubric").value = current.rubric;
+        }
         const showGrantModes = "approvalGrantModes" in (r.data || {});
         $("card-approval-grant-modes").classList.toggle("hidden", !showGrantModes);
         if (showGrantModes) {
@@ -6390,6 +6513,9 @@
         const showInteractiveFastMode = scope.startsWith("org:") && "interactiveFastMode" in r.data;
         $("card-interactive-fast-mode").classList.toggle("hidden", !showInteractiveFastMode);
         if (showInteractiveFastMode) $("interactive-fast-mode").checked = r.data.interactiveFastMode === true;
+        const showIndividualModelAuth = scope.startsWith("org:") && "individualModelAuth" in r.data;
+        $("card-individual-model-auth").classList.toggle("hidden", !showIndividualModelAuth);
+        if (showIndividualModelAuth) $("individual-model-auth").checked = r.data.individualModelAuth === true;
         const showHeaderPinDefault = scope.startsWith("org:") && "channelHeaderPinDefault" in r.data;
         $("card-channel-header-pin-default").classList.toggle("hidden", !showHeaderPinDefault);
         if (showHeaderPinDefault) $("channel-header-pin-default").checked = !!r.data.channelHeaderPinDefault;
@@ -6536,9 +6662,97 @@
           renderChips();
           syncDefault();
         }
+        function autoSaveAckEmoji() {
+          updateSectionDirty("ack-emoji");
+          const btn = sectionButton("ack-emoji");
+          if (btn && !btn.disabled) btn.click();
+        }
+        function initAckEmojiPicker() {
+          const chips = $("ack-emoji-chips");
+          const addInput = $("ack-emoji-add");
+          const renderAckChips = () => {
+            chips.querySelectorAll("[data-chip]").forEach((n) => n.remove());
+            ackEmojiNames.forEach((name) => {
+              const chip = document.createElement("span");
+              chip.dataset.chip = name;
+              chip.style.cssText =
+                "display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--border, #d4d4d4);border-radius:999px;font-size:13px";
+              const label = document.createElement("span");
+              const url = ackEmojiCatalog[name];
+              if (url) {
+                const img = document.createElement("img");
+                img.src = url;
+                img.alt = name;
+                img.style.cssText = "width:16px;height:16px;vertical-align:middle;margin-right:4px";
+                label.appendChild(img);
+              }
+              label.appendChild(document.createTextNode(":" + name + ":"));
+              const x = document.createElement("button");
+              x.type = "button";
+              x.textContent = "×";
+              x.setAttribute("aria-label", "Remove " + name);
+              x.style.cssText = "border:0;background:none;cursor:pointer;padding:0;font-size:14px;line-height:1";
+              x.onclick = () => {
+                ackEmojiNames = ackEmojiNames.filter((v) => v !== name);
+                renderAckChips();
+                autoSaveAckEmoji();
+              };
+              chip.appendChild(label);
+              chip.appendChild(x);
+              chips.insertBefore(chip, addInput);
+            });
+            const dl = $("ack-emoji-catalog");
+            dl.textContent = "";
+            Object.keys(ackEmojiCatalog)
+              .filter((n) => !ackEmojiNames.includes(n))
+              .sort()
+              .forEach((n) => {
+                const o = document.createElement("option");
+                o.value = n;
+                dl.appendChild(o);
+              });
+          };
+          const addEmoji = () => {
+            const name = addInput.value
+              .trim()
+              .replace(/^:+|:+$/g, "")
+              .toLowerCase();
+            if (!name || !/^[a-z0-9_+-]+$/.test(name)) return;
+            if (!ackEmojiNames.includes(name)) {
+              ackEmojiNames.push(name);
+              renderAckChips();
+              autoSaveAckEmoji();
+            }
+            addInput.value = "";
+            renderAckChips();
+          };
+          addInput.onchange = addEmoji;
+          addInput.onkeydown = (e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              addEmoji();
+            }
+          };
+          if (!ackEmojiCatalogLoaded) {
+            ackEmojiCatalogLoaded = true;
+            api("GET", "/api/slack-emoji")
+              .then((res) => {
+                if (res && res.ok && res.data && res.data.emoji) ackEmojiCatalog = res.data.emoji;
+                renderAckChips();
+              })
+              .catch(() => {});
+          }
+          renderAckChips();
+        }
         const showPeopleDirectory = scope.startsWith("org:");
         $("card-people-directory").classList.toggle("hidden", !showPeopleDirectory);
         if (showPeopleDirectory) $("people-directory-url").value = r.data.peopleDirectoryUrl || "";
+        const showAckEmoji = scope.startsWith("org:") && "ackEmoji" in r.data;
+        $("card-ack-emoji").classList.toggle("hidden", !showAckEmoji);
+        if (showAckEmoji) {
+          ackEmojiNames = Array.isArray(r.data.ackEmoji) ? [...r.data.ackEmoji] : [];
+          initAckEmojiPicker();
+        }
         const showBranding = scope.startsWith("org:") && "branding" in r.data;
         $("card-branding").classList.toggle("hidden", !showBranding);
         if (showBranding) {
@@ -6546,6 +6760,7 @@
           $("branding-accent").value = b.accent || "";
           $("branding-mark").value = b.mark || "";
           $("branding-self-label").value = b.selfLabel || "";
+          $("branding-org-name").value = b.orgName || "";
         }
 
         const showBrowseSteps = scope.startsWith("org:") && "browseMaxSteps" in r.data;
@@ -7127,19 +7342,20 @@
         const baseModel = config.data.baseModel || config.data.baseModelDefault || "";
         const baseProvider = onboardingProviderForModel(baseModel);
         const baseStatus = onboardingModelStatuses.find((item) => item.provider === baseProvider);
-        onboardingBadge(
-          "onboarding-model-badge",
-          baseStatus?.configured ? "Ready" : "Needs a key",
-          Boolean(baseStatus?.configured),
-        );
+        const harnessAuth = models.data.harnessAuth;
+        const baseHarnessAuth = Boolean(harnessAuth && harnessAuth.provider === baseProvider);
+        const baseReady = Boolean(baseModel) && (Boolean(baseStatus?.configured) || baseHarnessAuth);
+        onboardingBadge("onboarding-model-badge", baseReady ? "Ready" : "Needs a key", baseReady);
         $("onboarding-model-summary").textContent = !baseModel
           ? "No base model is configured yet — pick a provider and model below."
           : baseStatus?.configured
             ? baseModel + " · " + (baseStatus.source === "admin" ? "admin-managed key" : "deployment key")
-            : baseModel +
-              " cannot run until its " +
-              (MODEL_PROVIDER_LABELS[baseProvider] || connectorName(baseProvider)) +
-              " key is configured.";
+            : baseHarnessAuth
+              ? baseModel + " · authenticated by the " + harnessAuth.harnessId + " harness — no API key needed."
+              : baseModel +
+                " cannot run until its " +
+                (MODEL_PROVIDER_LABELS[baseProvider] || connectorName(baseProvider)) +
+                " key is configured.";
         renderOnboardingProviderOptions(baseProvider);
         renderOnboardingModelOptions(baseModel);
 
@@ -7151,7 +7367,7 @@
         );
         $("onboarding-slack-summary").textContent = slack.data.configured
           ? "Connected to " + (slack.data.teamName || slack.data.teamId || "a Slack workspace") + "."
-          : "Create the QM app, install it, then add its bot and Socket Mode tokens.";
+          : "Create the Slack app, install it, then add its bot and Socket Mode tokens.";
         if (slack.data.createUrl) $("onboarding-slack-create").href = slack.data.createUrl;
 
         const configured = (catalog.data.catalog || []).filter((item) => item.configured);
@@ -8003,6 +8219,11 @@
       $("egress-deny").addEventListener("input", renderEgressValidation);
       const SAVE = {
         "security-posture": () => ({ posture: $("security-posture").value }),
+        "auto-flagger": () => ({
+          harnessId: $("auto-flagger-harness").value,
+          modelId: $("auto-flagger-model").value,
+          rubric: $("auto-flagger-rubric").value,
+        }),
         "approval-grant-modes": () => ({
           session: $("approval-grant-session").checked,
           always: $("approval-grant-always").checked,
@@ -8014,6 +8235,7 @@
         "external-slack-participants": () => ({ on: $("external-slack-participants").checked }),
         "org-ambient": () => ({ on: $("org-ambient").checked }),
         "interactive-fast-mode": () => ({ on: $("interactive-fast-mode").checked }),
+        "individual-model-auth": () => ({ on: $("individual-model-auth").checked }),
         "channel-header-pin-default": () => ({ on: $("channel-header-pin-default").checked }),
         runtime: () => ({ harnessId: $("base-harness").value, modelId: $("base-model").value }),
         "approved-harnesses": () => ({
@@ -8028,10 +8250,12 @@
           return { ids };
         },
         "people-directory-url": () => ({ url: $("people-directory-url").value.trim() }),
+        "ack-emoji": () => ({ names: ackEmojiNames }),
         branding: () => ({
           accent: $("branding-accent").value.trim(),
           mark: $("branding-mark").value.trim(),
           selfLabel: $("branding-self-label").value.trim(),
+          orgName: $("branding-org-name").value.trim(),
         }),
         "browse-max-steps": () => ({ steps: $("browse-max-steps").value.trim() }),
         "turn-wall-clock": () => ({ sec: $("turn-wall-clock").value.trim() }),
@@ -8039,6 +8263,7 @@
       };
       const SAVE_ST = {
         "security-posture": "st-security-posture",
+        "auto-flagger": "st-auto-flagger",
         "approval-grant-modes": "st-approval-grant-modes",
         "command-policy": "st-policy",
         soul: "st-soul",
@@ -8047,11 +8272,13 @@
         "external-slack-participants": "st-external-slack-participants",
         "org-ambient": "st-org-ambient",
         "interactive-fast-mode": "st-interactive-fast-mode",
+        "individual-model-auth": "st-individual-model-auth",
         "channel-header-pin-default": "st-channel-header-pin-default",
         runtime: "st-runtime",
         "approved-harnesses": "st-approved-harnesses",
         "webui-models": "st-webui-models",
         "people-directory-url": "st-people-directory-url",
+        "ack-emoji": "st-ack-emoji",
         "browse-max-steps": "st-browse-max-steps",
         "turn-wall-clock": "st-turn-wall-clock",
         "browse-model": "st-browse-model",
@@ -8059,17 +8286,38 @@
       };
       const SAVE_RELOADS = new Set([
         "soul",
+        "auto-flagger",
         "external-slack-participants",
         "runtime",
         "approved-harnesses",
         "webui-models",
         "people-directory-url",
+        "ack-emoji",
         "browse-max-steps",
         "turn-wall-clock",
         "browse-model",
         "branding",
       ]);
       const sectionSnapshots = new Map();
+      function autoFlaggerTestSummary(data) {
+        if (!data.sampled) return data.message || "No past screenings to replay yet.";
+        const pct = (value) => (value == null ? "n/a" : (value * 100).toFixed(1) + "%");
+        const parts = ["Flagged " + data.flagged + " of " + data.scored + " scored (" + pct(data.flagRate) + ")"];
+        if (data.baseline) {
+          parts.push(
+            "current rubric flags " +
+              pct(data.baseline.flagRate) +
+              " · " +
+              plural(data.baseline.changed, "verdict") +
+              " changed",
+          );
+        }
+        if (data.unscreened) parts.push(plural(data.unscreened, "sample") + " came back unscreened");
+        if (data.errors) parts.push(plural(data.errors, "sample") + " errored");
+        if (data.partial) parts.push("stopped at the time limit — partial result");
+        parts.push("sampled " + data.sampled + " · " + Math.round(data.durationMs / 100) / 10 + "s");
+        return parts.join(" · ");
+      }
       function sectionButton(key) {
         return document.querySelector('[data-save="' + key + '"]');
       }
@@ -8147,6 +8395,43 @@
         return Promise.resolve(true);
       }
       let governanceSaveSeq = 0;
+      $("auto-flagger-test").onclick = async () => {
+        const button = $("auto-flagger-test");
+        const windowField = $("auto-flagger-window");
+        const requested = Number(windowField.value);
+        if (!Number.isInteger(requested) || requested < 1 || requested > 500) {
+          return setStatus("st-auto-flagger-test", "Window must be a whole number between 1 and 500.", "err", true);
+        }
+        $("auto-flagger-test-result").hidden = false;
+        setStatus(
+          "st-auto-flagger-test",
+          "Replaying the last " + requested + " screenings through this rubric…",
+          "",
+          true,
+        );
+        button.disabled = true;
+        try {
+          const r = await api("POST", "/api/scopes/" + encodeURIComponent(scope) + "/auto-flagger/test", {
+            window: requested,
+            compare: $("auto-flagger-compare").checked,
+            harnessId: $("auto-flagger-harness").value,
+            modelId: $("auto-flagger-model").value,
+            rubric: $("auto-flagger-rubric").value,
+          });
+          if (!r.ok) {
+            return setStatus("st-auto-flagger-test", r.data?.message || "Test run failed.", "err", true);
+          }
+          setStatus("st-auto-flagger-test", autoFlaggerTestSummary(r.data), r.data.errors ? "warn" : "ok", true);
+        } finally {
+          button.disabled = false;
+        }
+      };
+      $("auto-flagger-reset").onclick = async () => {
+        const r = await api("PUT", "/api/scopes/" + encodeURIComponent(scope) + "/auto-flagger", { reset: true });
+        if (!r.ok) return setStatus("st-auto-flagger", r.data?.message || "Reset failed.", "err");
+        await loadScope();
+        setStatus("st-auto-flagger", "Default restored", "ok");
+      };
       document.querySelectorAll("[data-save]").forEach((btn) => {
         btn.onclick = async () => {
           const key = btn.dataset.save;
@@ -10590,6 +10875,21 @@
             "err",
           );
       }
+      async function revokeExternalUser(m) {
+        const question =
+          m.status === "active"
+            ? 'Revoke access for "' + m.email + '"? They will no longer be able to sign in.'
+            : 'Remove "' + m.email + '" from the list?';
+        if (!confirm(question)) return;
+        const r = await api("DELETE", "/api/external-users/" + encodeURIComponent(m.email));
+        if (r.ok) renderData();
+        else
+          setStatus(
+            "st-external",
+            r.status === 403 ? "Only an org admin may revoke." : r.data?.message || "Revoke failed.",
+            "err",
+          );
+      }
       function keychainGrantStatus(g) {
         const expired = g.expiresAt && g.expiresAt <= Date.now();
         if (expired && g.status === "active") return ["expired", "warn"];
@@ -10786,6 +11086,7 @@
       function renderUsers(root, d) {
         const users = d.users || [];
         const grants = d.grants || [];
+        const externalUsers = d.externalUsers || [];
         let filterVal = "";
         defaultShell({
           stats: [
@@ -10917,6 +11218,97 @@
         impCard.querySelector(".body").append(impDatalist, impSt);
         root.appendChild(impCard);
 
+        const inviteEmail = d.inviteEmail || {};
+        const emailInput = document.createElement("input");
+        emailInput.type = "email";
+        emailInput.placeholder = "name@example.com";
+        emailInput.spellcheck = false;
+        emailInput.autocapitalize = "none";
+        const roleSelect = document.createElement("select");
+        roleSelect.append(new Option("Member", "member"), new Option("Org admin", "org_admin"));
+        const isoDay = (ms) => new Date(ms).toISOString().slice(0, 10);
+        const expiresInput = document.createElement("input");
+        expiresInput.type = "date";
+        expiresInput.min = isoDay(Date.now());
+        expiresInput.value = isoDay(Date.now() + 30 * 86400000);
+        const inviteBtn = document.createElement("button");
+        inviteBtn.className = "primary";
+        inviteBtn.type = "button";
+        inviteBtn.textContent = inviteEmail.configured === false ? "Add user" : "Send invite";
+        inviteBtn.onclick = async () => {
+          const email = emailInput.value.trim();
+          if (!email) return setStatus("st-external", "Email required.", "err");
+          if (!expiresInput.value) return setStatus("st-external", "Expiry date required.", "err");
+          inviteBtn.disabled = true;
+          const r = await api("POST", "/api/external-users", {
+            email,
+            role: roleSelect.value,
+            expiresAt: expiresInput.value,
+          });
+          inviteBtn.disabled = false;
+          if (!r.ok)
+            return setStatus(
+              "st-external",
+              r.status === 403 ? "Only an org admin may invite." : r.data?.message || "Invite failed.",
+              "err",
+            );
+          const member = r.data.member;
+          const expires = " (expires " + fmtTime(member.expiresAt) + ")";
+          await renderData();
+          setStatus(
+            "st-external",
+            r.data.emailSent
+              ? "Invite sent to " + member.email + expires
+              : r.data.emailProblem
+                ? "Added " +
+                  member.email +
+                  ", but no invitation email was sent: " +
+                  r.data.emailProblem +
+                  "." +
+                  (r.data.signInUrl ? " Portal: " + r.data.signInUrl + ". A working sign-in method is required." : "")
+                : "Updated " + member.email + " — " + labelRole(member.role) + expires,
+            r.data.emailSent || !r.data.emailProblem ? "ok" : "dirty",
+            true,
+          );
+        };
+        const inviteForm = document.createElement("div");
+        inviteForm.className = "grant-form";
+        inviteForm.append(
+          mkField("grow", "Email", emailInput),
+          mkField("", "Role", roleSelect),
+          mkField("", "Expires", expiresInput),
+          inviteBtn,
+        );
+        const inviteNote = document.createElement("p");
+        inviteNote.className = inviteEmail.configured === false ? "hint flag-warn" : "hint";
+        const signInHint = inviteEmail.signInUrl ? " Sign-in link to share: " + inviteEmail.signInUrl : "";
+        inviteNote.textContent =
+          inviteEmail.configured === false
+            ? (inviteEmail.problem || "Invitation emails are not configured") +
+              ". Users can still be added, but need a configured sign-in method before they can log in." +
+              signInHint
+            : "Invitation emails go out through Resend — core needs RESEND_API_KEY and AUTH_EMAIL_FROM. Without them users can still be added, but need a configured sign-in method before they can log in.";
+        const invite = document.createElement("div");
+        invite.className = "hidden";
+        invite.style.margin = "0 0 14px";
+        invite.append(inviteForm, inviteNote);
+        const addBtn = document.createElement("button");
+        addBtn.type = "button";
+        addBtn.className = "rowbtn";
+        addBtn.textContent = "+";
+        addBtn.title = "Add external user";
+        addBtn.setAttribute("aria-label", "Add external user");
+        addBtn.setAttribute("aria-expanded", "false");
+        addBtn.onclick = () => {
+          const open = !invite.classList.toggle("hidden");
+          addBtn.setAttribute("aria-expanded", String(open));
+          if (open) emailInput.focus();
+        };
+        const externalSt = document.createElement("p");
+        externalSt.className = "status";
+        externalSt.id = "st-external";
+        externalSt.style.margin = "10px 0 0";
+
         const lists = document.createElement("div");
         lists.className = "list-root";
         root.appendChild(lists);
@@ -10928,6 +11320,7 @@
           const filteredUsers = users.filter((u) =>
             matches([u.principalId, u.admin?.role || "", u.admin?.scopeId || "member"]),
           );
+          const filteredExternal = externalUsers.filter((m) => matches([m.email, m.role, m.invitedBy || "", m.status]));
 
           const admins = actionTable(
             ["Principal", "Role", "Scope", "Granted by", ""],
@@ -10988,11 +11381,40 @@
             (u) => go({ view: "user", scope, session: null, principal: u.principalId }),
             "No users match.",
           );
+          const usersCard = dataCard(
+            "Users",
+            "Everyone who has used the agent — click a row for their activity, artifacts, and config.",
+            roster,
+          );
+          usersCard.querySelector(".head h2").append(" ", addBtn);
+          usersCard.querySelector(".body").prepend(invite);
+          usersCard.querySelector(".body").appendChild(externalSt);
+          lists.appendChild(usersCard);
+
+          const external = actionTable(
+            ["Email", "Role", "Expires", "Invited by", "Status", ""],
+            filteredExternal,
+            (m) => [
+              { text: m.email, cls: "mono" },
+              nodeCell(mutedText(labelRole(m.role))),
+              (m.status === "active" ? "Ends " : "Ended ") + isoDay(m.expiresAt) + " (UTC)",
+              m.invitedBy || "-",
+              { badge: m.status === "active" ? "Active" : "Expired", kind: m.status === "active" ? "ok" : "warn" },
+              m.status === "active"
+                ? { action: { label: "Revoke", danger: true, run: () => revokeExternalUser(m) } }
+                : Date.now() - m.expiresAt >= 86400000
+                  ? { action: { label: "Remove", run: () => revokeExternalUser(m) } }
+                  : "",
+            ],
+            externalUsers.length
+              ? "No external users match."
+              : "No external users. Use + on the Users card to invite one.",
+          );
           lists.appendChild(
             dataCard(
-              "Users",
-              "Everyone who has used the agent — click a row for their activity, artifacts, and config.",
-              roster,
+              "External users",
+              "Outside collaborators invited by email. They sign in at the portal with that address until it expires.",
+              external,
             ),
           );
         };
@@ -11530,14 +11952,27 @@
           actions: [sortControl],
         });
         const activityTime = (s) => (scopeSort === "human" ? s.lastConversationActivity || 0 : s.lastActivity || 0);
+        const attachedScopesLabel = (attached) => {
+          if (!attached.length) return "no scopes attached";
+          const names = attached.map((id) => shortName(id));
+          const shown = names.slice(0, 4).join(", ");
+          const extra = names.length - 4;
+          return extra > 0 ? `${shown} +${plural(extra, "more scope")}` : shown;
+        };
         if (environmentDir.length) {
           const environments = denseList(
             environmentDir,
-            (environment) => ({
-              name: environment.name || shortName(environment.id),
-              preview: plural(environment.attachedScopes?.length || 0, "attached scope"),
-              href: stateToUrl({ view: "history", scope: environment.id, historyKind }),
-            }),
+            (environment) => {
+              const attached = environment.attachedScopes || [];
+              const preview = document.createElement("span");
+              preview.textContent = attachedScopesLabel(attached);
+              if (attached.length) preview.title = attached.map((id) => shortName(id)).join(", ");
+              return {
+                name: environment.name || shortName(environment.id),
+                preview,
+                href: stateToUrl({ view: "history", scope: environment.id, historyKind }),
+              };
+            },
             (environment) => selectScope(environment.id),
             "No named environments.",
           );
@@ -11553,6 +11988,14 @@
             counts.className = "dense-tag";
             counts.textContent = sessionCountsLabel(s.sessions || 0, s.backgroundSessions || 0);
             preview.appendChild(counts);
+            if (s.environmentAttachment) {
+              const env = document.createElement("span");
+              env.className = "dense-tag";
+              env.textContent =
+                "env: " + (s.environmentAttachment.environmentName || shortName(s.environmentAttachment.environmentId));
+              env.title = "This scope is attached to a named environment.";
+              preview.appendChild(env);
+            }
             if (s.lastMessage) preview.appendChild(document.createTextNode(s.lastMessage));
             return {
               name: shortName(s.scopeId),
@@ -11647,6 +12090,34 @@
             title: scopeKind(scope) !== "org" ? shortName(scope) : VIEW_TITLE.history,
             tabs,
           });
+        }
+        const environmentEntry = (environmentDir || []).find((environment) => environment.id === scope);
+        if (environmentEntry && !cronSel) {
+          const attached = environmentEntry.attachedScopes || [];
+          const chips = document.createElement("div");
+          chips.className = "history-empty-scopes";
+          attached.forEach((id) => {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "history-empty-scope";
+            button.textContent = shortName(id);
+            button.title = id;
+            button.onclick = () => selectScope(id);
+            chips.appendChild(button);
+          });
+          if (!attached.length) {
+            const none = document.createElement("p");
+            none.className = "empty";
+            none.textContent = "No scopes attached.";
+            chips.appendChild(none);
+          }
+          root.appendChild(
+            dataCard(
+              "Attached scopes",
+              plural(attached.length, "scope") + " share this environment's computer and working memory.",
+              chips,
+            ),
+          );
         }
         const cronDeliveryChip = (delivered, label) => {
           if (!delivered) return null;

@@ -4,7 +4,14 @@ import { mintPortalIdentity, PORTAL_IDENTITY_HEADER } from "../../chassis/src/po
 
 const IDENTITY_TTL_MS = 60_000;
 
-const FORWARD_REQUEST_HEADERS = ["content-type", "accept", "accept-language", "user-agent", "accept-encoding"];
+const FORWARD_REQUEST_HEADERS = [
+  "content-type",
+  "accept",
+  "accept-language",
+  "user-agent",
+  "accept-encoding",
+  "sec-fetch-dest",
+];
 
 const DROP_RESPONSE_HEADERS = new Set([
   "connection",
@@ -113,6 +120,19 @@ export function proxyToSurface(req: IncomingMessage, res: ServerResponse, t: Sur
     headers,
   });
 }
+
+export const FORWARD_WEBHOOK_HEADERS = [
+  "content-type",
+  "x-hub-signature-256",
+  "x-github-event",
+  "x-github-delivery",
+  "x-github-hook-id",
+  "x-slack-signature",
+  "x-slack-request-timestamp",
+  "stripe-signature",
+  "x-signature",
+  "x-delivery-id",
+];
 
 export const FORWARD_AGENT_API_HEADERS = [
   "content-type",

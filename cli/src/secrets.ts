@@ -1,6 +1,7 @@
 import { isVirtualService, type DeclaredServiceName } from "./services.ts";
 import type { ModelProvider, QmConfig } from "./config.ts";
 import { TARGET_ENV_DEFAULTS } from "./target-env-defaults.ts";
+import { deploymentSecretValue } from "./util.ts";
 
 type SecretCondition =
   | { kind: "env-equals"; service: DeclaredServiceName; name: string; value: string }
@@ -19,7 +20,7 @@ export interface SecretSpec {
   name: string;
   service: DeclaredServiceName;
   envName?: string;
-  required: boolean | { when: SecretCondition; optionalOtherwise?: true };
+  required: boolean | { when: SecretCondition; optional?: true; optionalOtherwise?: true };
   description: string;
   generate?: string;
   managedBy?: "operator" | "terraform";
@@ -126,6 +127,23 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
     generate: "fly tokens create org -o <fly-org> -x 8760h",
   },
   {
+    name: "PORTER_DEPLOY_API_TOKEN",
+    service: "core",
+    required: {
+      when: {
+        kind: "any",
+        conditions: [
+          { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "porter" },
+          { kind: "env-equals", service: "core", name: "DEPLOY_PROVIDER", value: "porter" },
+        ],
+      },
+    },
+    description:
+      "Admin-role Porter API token for the sandbox backend and the per-deployment app publisher — Developer-role tokens fail mid-deployment with PERMISSION_DENIED.",
+    generate:
+      "create an Admin-role API token in the Porter dashboard (https://dashboard.porter.run → Settings → API tokens)",
+  },
+  {
     name: "SPRITES_TOKEN",
     service: "core",
     required: { when: { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "sprites" } },
@@ -138,6 +156,21 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
     required: { when: { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "smolmachines" } },
     description: "smolmachines API key for the agent-computer substrate.",
     generate: "create an API key in the smolmachines console (https://smolmachines.com/console)",
+  },
+  {
+    name: "AGENT37_API_KEY",
+    service: "core",
+    required: {
+      when: {
+        kind: "any",
+        conditions: [
+          { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "agent37" },
+          { kind: "env-equals", service: "core", name: "SANDBOX_SECONDARY_BACKEND", value: "agent37" },
+        ],
+      },
+    },
+    description: "Agent37 API key for the agent-computer substrate.",
+    generate: "mint a key in the Agent37 dashboard (https://agent37.com/dashboard/cloud/api-keys)",
   },
   {
     name: "DATABASE_URL",
@@ -156,8 +189,16 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
   {
     name: "AWS_DEPLOY_GATE_SECRET",
     service: "core",
-    required: { when: { kind: "env-present", service: "core", name: "AWS_DEPLOY_APPS_DOMAIN" } },
-    description: "HMAC key protecting public AWS deployment-app URLs.",
+    required: {
+      when: {
+        kind: "any",
+        conditions: [
+          { kind: "env-present", service: "core", name: "AWS_DEPLOY_APPS_DOMAIN" },
+          { kind: "env-present", service: "core", name: "DEPLOY_APPS_DOMAIN" },
+        ],
+      },
+    },
+    description: "HMAC key protecting public deployment-app URLs on the apps domain.",
     generate: MINT_LOCALLY,
   },
   {
@@ -336,6 +377,20 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
   },
   {
     name: "AUTH_ALLOWED_EMAILS",
+    service: "core",
+    required: {
+      when: {
+        kind: "all",
+        conditions: [
+          { kind: "service-enabled", service: "auth" },
+          { kind: "env-absent", service: "auth", name: "AUTH_ALLOWED_EMAIL_DOMAIN" },
+        ],
+      },
+    },
+    description: "Email-auth principals protected from unrelated directory-source deactivation.",
+  },
+  {
+    name: "AUTH_ALLOWED_EMAILS",
     service: "portal",
     envName: "OIDC_ALLOWED_EMAILS",
     required: {
@@ -352,31 +407,57 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
   {
     name: "AUTH_EMAIL_FROM",
     service: "auth",
-    required: true,
-    description: 'Verified sender for sign-in links, e.g. "Acme <no-reply@acme.com>".',
+    required: false,
+    description: 'Verified sender for sign-in links and external-user invitations, e.g. "Acme <no-reply@acme.com>".',
+  },
+  {
+    name: "AUTH_EMAIL_FROM",
+    service: "core",
+    required: false,
+    description:
+      "Sender for external-user invitations sent from the admin Users tab or by chatting with QM; the same verified sender the sign-in broker uses.",
   },
   {
     name: "RESEND_API_KEY",
     service: "auth",
-    required: { when: { kind: "env-equals", service: "auth", name: "AUTH_EMAIL_TRANSPORT", value: "resend" } },
-    description: "Resend API key used to deliver sign-in links.",
+    required: {
+      when: { kind: "env-equals", service: "auth", name: "AUTH_EMAIL_TRANSPORT", value: "resend" },
+      optional: true,
+    },
+    description: "Resend API key used to deliver sign-in links and external-user invitations.",
+  },
+  {
+    name: "RESEND_API_KEY",
+    service: "core",
+    required: false,
+    description:
+      "Lets core email invitations to external users, added from the admin Users tab or by chatting with QM, through Resend.",
   },
   {
     name: "SMTP_HOST",
     service: "auth",
-    required: { when: { kind: "env-equals", service: "auth", name: "AUTH_EMAIL_TRANSPORT", value: "smtp" } },
+    required: {
+      when: { kind: "env-equals", service: "auth", name: "AUTH_EMAIL_TRANSPORT", value: "smtp" },
+      optional: true,
+    },
     description: "SMTP relay hostname used to deliver sign-in links.",
   },
   {
     name: "SMTP_USERNAME",
     service: "auth",
-    required: { when: { kind: "env-equals", service: "auth", name: "AUTH_EMAIL_TRANSPORT", value: "smtp" } },
+    required: {
+      when: { kind: "env-equals", service: "auth", name: "AUTH_EMAIL_TRANSPORT", value: "smtp" },
+      optional: true,
+    },
     description: "SMTP username for the sign-in-link relay.",
   },
   {
     name: "SMTP_PASSWORD",
     service: "auth",
-    required: { when: { kind: "env-equals", service: "auth", name: "AUTH_EMAIL_TRANSPORT", value: "smtp" } },
+    required: {
+      when: { kind: "env-equals", service: "auth", name: "AUTH_EMAIL_TRANSPORT", value: "smtp" },
+      optional: true,
+    },
     description: "SMTP password for the sign-in-link relay.",
   },
 ];
@@ -391,8 +472,12 @@ function conditionMatches(config: QmConfig, condition: SecretCondition): boolean
   if (condition.kind === "env-all-absent") {
     return condition.names.every((name) => !config.env[condition.service]?.[name]?.trim());
   }
+  const configuredSandboxBackend =
+    condition.service === "core" && condition.name === "SANDBOX_BACKEND" ? config.sandbox?.backend : undefined;
   const value = (
-    config.env[condition.service]?.[condition.name] ?? targetEnvDefault(config, condition.service, condition.name)
+    config.env[condition.service]?.[condition.name] ??
+    configuredSandboxBackend ??
+    targetEnvDefault(config, condition.service, condition.name)
   )?.trim();
   if (condition.kind === "env-absent") return !value;
   if (condition.kind === "env-present") return Boolean(value);
@@ -406,8 +491,18 @@ function targetEnvDefault(config: QmConfig, service: string, name: string): stri
 
 function requirementFor(config: QmConfig, spec: SecretSpec): boolean | null {
   if (typeof spec.required === "boolean") return spec.required;
-  if (conditionMatches(config, spec.required.when)) return true;
+  if (conditionMatches(config, spec.required.when)) return !spec.required.optional;
   return spec.required.optionalOtherwise ? false : null;
+}
+
+export function emailSecretNames(config: QmConfig): string[] {
+  if (!config.services.includes("auth")) return [];
+  return [
+    "AUTH_EMAIL_FROM",
+    ...(config.env.auth?.AUTH_EMAIL_TRANSPORT?.trim() === "smtp"
+      ? ["SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD"]
+      : ["RESEND_API_KEY"]),
+  ];
 }
 
 export function computedSecrets(config: QmConfig): ComputedSecret[] {
@@ -544,6 +639,21 @@ export function secretsForService(
   pluginNames: readonly string[] = [],
 ): ComputedSecret[] {
   return computedSecrets(config).filter((secret) => secretDestinations(secret, pluginNames).has(service));
+}
+
+export function serviceSecretValue(
+  config: QmConfig,
+  service: DeclaredServiceName,
+  name: string,
+  values: ReadonlyMap<string, string>,
+): string | undefined {
+  let value = config.env[service]?.[name];
+  for (const secret of secretsForService(config, service)) {
+    if (!runtimeSecretNames(service, secret).includes(name)) continue;
+    const supplied = deploymentSecretValue(secret.name, values.get(secret.name));
+    if (supplied !== undefined) value = supplied;
+  }
+  return value;
 }
 
 function requiresOtherEmailTransport(config: QmConfig, condition: SecretCondition): boolean {

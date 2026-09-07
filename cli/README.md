@@ -22,9 +22,9 @@ This package is published to npm as `@yc-software/qm`, with npm provenance attes
 building workflow. A release is one dispatch of `.github/workflows/release.yml` from
 `main`: it signs and pushes the first-party images, publishes the package pinning their
 digests, and then tags `v<version>` and creates the GitHub release with the resolved
-digests attached. The version comes from `cli/package.json`, which CI requires a pull
-request to bump whenever it changes what the package ships; a tag that already exists
-stops the release rather than moving. The checked-in image manifest is a sentinel that
+digests attached. Each release picks its own version: a patch bump past the latest released version, or
+`cli/package.json`'s version when a PR raised it higher (for a minor or major bump); a
+tag that already exists stops the release rather than moving. The checked-in image manifest is a sentinel that
 a deployment overrides with real digests. The packed-artifact test exercises the consumer
 path locally.
 
@@ -63,6 +63,12 @@ computed secret names, tools, skills, and plugins without network access; `up`, 
 `sandbox build` run the same checks first. `doctor` verifies external prerequisites read-only.
 `plan` renders the deployment; AWS mutation requires `up --yes`.
 
+For a single-host Docker deployment, `sandbox.backend: "local"` runs each agent
+computer in its own container. `qm up` builds the local runtime from the CLI's
+pinned sandbox base, mounts the host Docker socket into trusted core, and connects
+core to each sandbox's private network. An explicit `sandbox.image` uses that
+runnable local image instead.
+
 On AWS, `up` snapshots the RDS instance under the deploy lease before its first
 mutation, names the snapshot after the deployment manifest it precedes, and
 records it in that manifest. `rollback` restores code and configuration only,
@@ -96,6 +102,7 @@ plan
 up [--yes] [--build-from[=repo]] [--image-label label]
 slack render
 outputs [--json]
+admin-login [--email admin@example.com]
 proof scope-key <scope-id>
 secrets push [--from file]
 status
@@ -106,7 +113,29 @@ sandbox build [--from image] [--tag tag] [--dry-run]
 sandbox publish [--from image] [--app registry/repo] [--tag tag] [--dry-run]
 ```
 
-All deploy commands accept `--config`, `--env-file`, and `--sandbox-dir`. `dev` remains
+## Administrator login without email
+
+After deployment, run `qm admin-login` to print a single-use login URL valid for
+five minutes. Open it and confirm the displayed administrator email. The command
+uses the deployment's existing `PORTAL_SESSION_SECRET` and the email in
+`ADMIN_GRANTS`; if several admins are configured, select one with `--email`.
+QM checks that the selected account still has `org_admin` access when the link
+is redeemed. The command creates no account or role grant.
+
+Run it from the deployment directory with its `.env`, or use `--config` and
+`--env-file`. Inside a running deployment without a config file, supply
+`PORTAL_PUBLIC_URL`, `PORTAL_SESSION_SECRET`, and `ADMIN_GRANTS` through its
+environment. The CLI prints only the URL, which is a temporary login credential;
+do not publish it or put it in shared logs.
+
+`qm setup` offers email setup separately. Skip it to use administrator login
+without Resend or SMTP. To enable ordinary email login later, rerun `qm setup`
+and configure the selected transport's complete credential set and sender,
+then push secrets and redeploy. Missing email credentials disable email sign-in;
+QM and `qm admin-login` remain available, even if a sender is still configured.
+
+Deployment commands accept `--config`, `--env-file`, and `--sandbox-dir`;
+`admin-login` uses only `--config` and `--env-file`. `dev` remains
 the contributor worktree loop and is separate from the portable deployment contract.
 
 ## Package contract

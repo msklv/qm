@@ -7,9 +7,11 @@ export interface Me {
   slackWorkspaceUrl?: string | null;
   impersonatedBy?: string | null;
   permissions?: string[];
+  individualModelAuth?: boolean;
+  modelAuthConnected?: boolean;
 }
 
-const VIEWS = ["chats", "contexts", "crons", "files", "keychain", "deploys", "memory", "skills"] as const;
+const VIEWS = ["chats", "contexts", "webhooks", "crons", "files", "keychain", "deploys", "memory", "skills"] as const;
 export type View = (typeof VIEWS)[number];
 
 export function isView(view: string | null | undefined): view is View {

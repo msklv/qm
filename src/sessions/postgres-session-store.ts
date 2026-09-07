@@ -18,6 +18,7 @@ import type {
   NewTapeRecord,
   ParticipantWindow,
   ScopeSessionStats,
+  ScreenSample,
   SessionOrigin,
   SessionOriginFilter,
   SessionPage,
@@ -38,6 +39,11 @@ import {
   stableOriginPattern,
   userMessagePreview,
 } from "./session-store.ts";
+import { SECURITY_SCREEN_STEP, screenPayloadFromEnvelope } from "../security/security-posture.ts";
+
+export const SESSION_ENTRIES_SEARCH_INDEX_SQL = `CREATE INDEX CONCURRENTLY IF NOT EXISTS session_entries_search_tsv
+  ON session_entries USING GIN (search_tsv)
+  WHERE type IN ('user', 'assistant', 'text')`;
 
 export function rowToSession(r: Record<string, unknown>): Session {
   return {
@@ -241,6 +247,8 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
       )`,
     `CREATE INDEX IF NOT EXISTS session_llm_requests_by_session
         ON session_llm_requests(session_id, created_at, step)`,
+    `CREATE INDEX IF NOT EXISTS session_llm_requests_screens
+        ON session_llm_requests(created_at DESC) WHERE step = -1`,
     `ALTER TABLE session_llm_requests ADD COLUMN IF NOT EXISTS ttft_ms INT`,
     `ALTER TABLE session_llm_requests ADD COLUMN IF NOT EXISTS duration_ms INT`,
     `ALTER TABLE session_llm_requests ADD COLUMN IF NOT EXISTS step_gap_ms INT`,
@@ -269,9 +277,10 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
                       ELSE NULL END;
         EXCEPTION WHEN others THEN RETURN NULL;
         END $entry_search_text$`,
-    `CREATE INDEX IF NOT EXISTS session_entries_search_fts
-        ON session_entries USING GIN (to_tsvector('simple', COALESCE(entry_search_text(payload), '')))
-        WHERE type IN ('user', 'assistant', 'text')`,
+    `ALTER TABLE session_entries ADD COLUMN IF NOT EXISTS search_tsv tsvector
+        GENERATED ALWAYS AS (to_tsvector('simple', COALESCE(entry_search_text(payload), ''))) STORED`,
+    SESSION_ENTRIES_SEARCH_INDEX_SQL,
+    `DROP INDEX IF EXISTS session_entries_search_fts`,
     `DELETE FROM session_entries WHERE session_id IN (SELECT id FROM sessions WHERE type IN ('channel','group') AND thread_ref ~ '^[a-z0-9_]+/[^:/]+$')`,
     `DELETE FROM participants WHERE session_id IN (SELECT id FROM sessions WHERE type IN ('channel','group') AND thread_ref ~ '^[a-z0-9_]+/[^:/]+$')`,
     `DELETE FROM session_leases WHERE session_id IN (SELECT id FROM sessions WHERE type IN ('channel','group') AND thread_ref ~ '^[a-z0-9_]+/[^:/]+$')`,
@@ -474,6 +483,16 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
       });
     },
 
+    async clearSecurityTaint(sessionId) {
+      const updated = await q(
+        "UPDATE session_entries SET payload = (payload::jsonb - 'securityTainted')::text " +
+          "WHERE session_id = $1 AND payload LIKE '%\"securityTainted\"%' RETURNING 1",
+        [sessionId],
+      );
+      if (updated.length > 0) return true;
+      return (await q("SELECT 1 FROM sessions WHERE id = $1", [sessionId])).length === 1;
+    },
+
     async appendTape(lease, rec: NewTapeRecord): Promise<TapeRecord> {
       return withLease(lease, "tape append without a valid session lease", (client) =>
         insertTapeRow(client, lease.sessionId, rec),
@@ -529,14 +548,14 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
       return rows.map(rowToEntry);
     },
 
-    async recordLlmRequest(sessionId, rec: NewLlmRequest): Promise<LlmRequestRecord> {
+    async recordLlmRequest(sessionId, rec: NewLlmRequest, signal?: AbortSignal): Promise<LlmRequestRecord> {
       const envelope = promptEnvelopeBody(rec.promptEnvelope);
       if (envelope) {
-        await q("INSERT INTO llm_prompt_envelopes(hash, body, created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING", [
-          envelope.hash,
-          envelope.body,
-          now(),
-        ]);
+        await q(
+          "INSERT INTO llm_prompt_envelopes(hash, body, created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
+          [envelope.hash, envelope.body, now()],
+          { signal },
+        );
       }
       const full: LlmRequestRecord = {
         id: randomUUID(),
@@ -578,6 +597,7 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
           full.transport ? JSON.stringify(full.transport) : null,
           full.gapPhases ? JSON.stringify(full.gapPhases) : null,
         ],
+        { signal },
       );
       return full;
     },
@@ -607,6 +627,32 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
         args,
       );
       return rows.map(rowToLlmRequest);
+    },
+
+    async listScreenSamples(limit): Promise<ScreenSample[]> {
+      const rows = await q(
+        `SELECT r.id, r.session_id, r.scope_label, r.created_at, r.model, e.body AS prompt_body
+           FROM session_llm_requests r JOIN llm_prompt_envelopes e ON e.hash = r.prompt_hash
+          WHERE r.step = $1
+          ORDER BY r.created_at DESC, r.id DESC
+          LIMIT $2`,
+        [SECURITY_SCREEN_STEP, Math.max(0, Math.trunc(limit))],
+      );
+      return rows.flatMap((r) => {
+        const payload = screenPayloadFromEnvelope(JSON.parse(r.prompt_body as string));
+        return payload
+          ? [
+              {
+                id: r.id as string,
+                sessionId: r.session_id as string,
+                scopeLabel: r.scope_label as ScopeId,
+                createdAt: Number(r.created_at),
+                model: r.model as string,
+                payload,
+              },
+            ]
+          : [];
+      });
     },
 
     async addParticipant(sessionId, principalId, title, opts): Promise<void> {
@@ -746,7 +792,7 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
            JOIN participants p ON p.session_id = e.session_id AND p.principal_id = $1
           WHERE e.type IN ('user', 'assistant', 'text')
             AND ${withinParticipantWindow("e", "p")}
-            AND to_tsvector('simple', COALESCE(entry_search_text(e.payload), '')) @@ to_tsquery('simple', $2)
+            AND e.search_tsv @@ to_tsquery('simple', $2)
           ORDER BY e.created_at DESC, e.session_id, e.seq DESC
           LIMIT $3`,
         [principalId, ts, Math.max(1, Math.min(limit, 200))],

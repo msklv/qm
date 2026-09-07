@@ -11,7 +11,7 @@ import { NonRetryableTurnError } from "../core/turn-error.ts";
 import { NeedsApproval } from "../tools/primitives.ts";
 import { deterministicCompactSummary, estimateHistoryTokens } from "./context-compaction.ts";
 import { countTokens } from "../util/tokens.ts";
-import { SECURITY_SCREEN_SYSTEM_PROMPT } from "../security/security-posture.ts";
+import { SECURITY_SCREEN_STEP, SECURITY_SCREEN_SYSTEM_PROMPT } from "../security/security-posture.ts";
 
 const READ_ONLY_BLOCKED_PREFIXES = [
   "!preamble",
@@ -24,6 +24,7 @@ const READ_ONLY_BLOCKED_PREFIXES = [
   "!paused-approval ",
   "!collect-approval ",
   "!collect-exec ",
+  "!screened-run ",
   "!double-exec ",
   "!read ",
   "!write ",
@@ -251,6 +252,8 @@ export function createMockHarness(): Harness {
           reply = turn.systemPrompt;
         } else if (command0 === "!wallclock") {
           reply = `wallclock:${turn.turnWallClockMs ?? 0}`;
+        } else if (command0 === "!surfacename") {
+          reply = `surface:${turn.surfaceName ?? "none"}`;
         } else if (command0.startsWith("!askagent ")) {
           const rest = command0.slice("!askagent ".length).trim();
           const sp = rest.indexOf(" ");
@@ -304,6 +307,34 @@ export function createMockHarness(): Harness {
             usedTool = true;
             reply = result.stdout.trim() || result.stderr.trim() || `(exit ${result.code})`;
           }
+        } else if (command0.startsWith("!screened-run ")) {
+          const command = cmd.slice(cmd.indexOf("!screened-run ") + "!screened-run ".length);
+          await turn.emit({ type: "tool_call", payload: { tool: "execute", command }, scopeLabel: turn.scopeLabel });
+          const result = await turn.tools.execute(command);
+          const output = result.stdout.trim() || result.stderr.trim() || `(exit ${result.code})`;
+          const screen = turn.screenToolResult
+            ? await turn.screenToolResult("execute", output, false).catch(() => "unscreened" as const)
+            : true;
+          if (screen === false) {
+            const stub = "[tool output quarantined by Auto security posture]";
+            await turn.emit({
+              type: "tool_result",
+              payload: {
+                tool: "execute",
+                quarantined: true,
+                quarantineReason: "screen_verdict",
+                result: stub,
+                isError: true,
+              },
+              scopeLabel: turn.scopeLabel,
+            });
+            reply = stub;
+          } else {
+            await turn.emit({ type: "tool_result", payload: result, scopeLabel: turn.scopeLabel });
+            reply = output;
+          }
+          turn.onProgress?.({ toolCalls: 1 });
+          usedTool = true;
         } else if (command0.startsWith("!reach ")) {
           const rest = command0.slice("!reach ".length);
           const sp = rest.indexOf(" ");
@@ -751,18 +782,25 @@ export function createMockHarness(): Harness {
         return Promise.resolve(JSON.stringify({ act: false }));
       },
 
-      async screenSecurity({ payload, signal, recordModelCall, recordLlmRequest }) {
-        const model = "mock-security";
+      async screenSecurity({
+        payload,
+        modelId,
+        systemPrompt = SECURITY_SCREEN_SYSTEM_PROMPT,
+        signal,
+        recordModelCall,
+        recordLlmRequest,
+      }) {
+        const model = modelId ?? "mock-security";
         recordModelCall({
           model,
-          inputTokens: countTokens(SECURITY_SCREEN_SYSTEM_PROMPT) + countTokens(payload),
+          inputTokens: countTokens(systemPrompt) + countTokens(payload),
           entryCount: 1,
         });
         await recordLlmRequest?.({
           turnSeq: null,
-          step: -1,
+          step: SECURITY_SCREEN_STEP,
           model,
-          promptEnvelope: { system: SECURITY_SCREEN_SYSTEM_PROMPT, messages: [{ role: "user", content: payload }] },
+          promptEnvelope: { system: systemPrompt, messages: [{ role: "user", content: payload }] },
           truncated: false,
         });
         if (/!security-screen-hang/i.test(payload)) {

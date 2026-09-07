@@ -3,6 +3,7 @@ import type {
   PendingApproval,
   PendingApprovalRecord,
   Permission,
+  Principal,
   ScopeId,
   Session,
   SessionEntry,
@@ -10,6 +11,7 @@ import type {
   TurnResult,
 } from "../types.ts";
 import type { OutgoingAttachment } from "../types.ts";
+import type { SecurityScreenProbe } from "../security/security-screener.ts";
 import type { Readable } from "node:stream";
 import { type FileArtifact, type FileArtifactStore, type ListOwnedOptions } from "../files/file-artifact-store.ts";
 import type { IdentityService } from "../identity/identity-service.ts";
@@ -27,6 +29,7 @@ import type { RunSignal, RunSignalStore } from "../runs/run-signal-store.ts";
 import type { TaskStore, TaskStatus } from "../tasks/task-store.ts";
 import type { ModelGateway } from "../model/model-gateway.ts";
 import type { ModelCredentialStore } from "../model/model-credential-store.ts";
+import type { UserModelCredentialStore } from "../model/user-model-credential-store.ts";
 import type { CustomProviderStore } from "../model/custom-provider-store.ts";
 import type { McpServerStore } from "../mcp/mcp-server-store.ts";
 import type { McpToolService } from "../mcp/mcp-tool-service.ts";
@@ -41,6 +44,8 @@ import type { CapabilityClaims } from "../auth/capability-token.ts";
 import type { ScopedConfigStore } from "../resolution/config-store.ts";
 import { type AdminService } from "../admin/admin-service.ts";
 import type { CronStore, CreateCronInput, CronPatch } from "../cron/cron-store.ts";
+import type { CronFirePage } from "../cron/cron-fire-store.ts";
+import type { WebhookStore, CreateWebhookInput } from "../webhooks/webhook-store.ts";
 import type { DeliveryStore } from "../delivery/delivery-store.ts";
 import type {
   ChannelMembership,
@@ -60,6 +65,7 @@ import type {
   SurfaceContextQuery,
   SurfaceContextRequest,
   SurfaceContextResult,
+  Webhook,
 } from "../types.ts";
 import type {
   ActiveThread,
@@ -92,6 +98,7 @@ import type { ModelProviderAvailability } from "../model/pi-models.ts";
 import type { RuntimeChoice } from "../harness/harness-router.ts";
 import { type ReachOpts, type ReachResolution, type ReachTarget } from "../reach/reach.ts";
 import { type Project, type ProjectStore } from "../projects/project-store.ts";
+import type { SearchHit } from "../search/core-search.ts";
 
 interface DeploymentVersionView {
   version: number;
@@ -283,6 +290,11 @@ export interface App {
   ): Promise<{ entry: SessionEntry } | null>;
   listSessions(principalId: string): Promise<Session[]>;
   searchSessions(principalId: string, query: string, limit?: number): Promise<SessionSearchHit[]>;
+  search(
+    query: string,
+    principals: readonly Principal[],
+    limit?: number,
+  ): Promise<{ hits: SearchHit[]; failedBackends: string[] }>;
   sessionBackground(sessionId: string, viewer: string): Promise<SessionBackgroundView | null>;
   readSessionBackgroundOutput(
     sessionId: string,
@@ -318,7 +330,9 @@ export interface App {
   listScopeResources(principalId: string, scope: ScopeId): Promise<ScopeResources | null>;
   managesScope(principalId: string, scope: ScopeId): Promise<boolean>;
   membershipControlsScope(scope: ScopeId): Promise<boolean>;
-  authorizesCapabilityScope(claims: Pick<CapabilityClaims, "actorId" | "scopeId" | "scopeVersion">): Promise<boolean>;
+  authorizesCapabilityScope(
+    claims: Pick<CapabilityClaims, "actorId" | "scopeId" | "scopeVersion" | "botActor" | "liveActor" | "members">,
+  ): Promise<boolean>;
   openFileForViewer(id: string, principalId: string): Promise<OpenedFile | null>;
   grant(g: Grant): Promise<void>;
   revokeGrant(ownerScopeId: ScopeId, ref: string, granteeScopeId: ScopeId, revokedBy: string): Promise<void>;
@@ -344,6 +358,7 @@ export interface App {
   ): Promise<number>;
   createCron(input: CreateCronInput): Promise<Cron>;
   getCron(id: string): Promise<Cron | null>;
+  getCronRuns(id: string, limit?: number): Promise<CronFirePage>;
   listCrons(): Promise<Cron[]>;
   listCronsForViewer(principalId: string): Promise<{ owned: Cron[]; visible: VisibleCron[] }>;
   updateCron(id: string, patch: CronPatch): Promise<Cron | null>;
@@ -351,6 +366,11 @@ export interface App {
   setCronEnabled(id: string, enabled: boolean): Promise<void>;
   setCronDestination(id: string, destination: Destination | undefined): Promise<Cron | null>;
   setCronRecipientConsent(id: string, recipientConsent: RecipientConsent): Promise<void>;
+  createWebhook(input: CreateWebhookInput): Promise<Webhook>;
+  getWebhook(id: string): Promise<Webhook | null>;
+  listWebhooks(): Promise<Webhook[]>;
+  setWebhookEnabled(id: string, enabled: boolean): Promise<void>;
+  setWebhookRecipientConsent(id: string, recipientConsent: RecipientConsent): Promise<void>;
   pendingDeliveries(type: string, claimMs?: number): Promise<Delivery[]>;
   enqueueDelivery(input: { destination: Destination; text: string; idempotencyKey: string }): Promise<void>;
   createContextRequest(source: string, query: SurfaceContextQuery): Promise<SurfaceContextRequest>;
@@ -386,8 +406,19 @@ export interface App {
   ackDeliveryByKey(idempotencyKey: string): Promise<void>;
   setRunDeliveryState(runId: string, state: RunDeliveryState): Promise<boolean>;
   upsertDirectory(members: DirectoryMember[], syncedAt?: number): Promise<void>;
-  upsertChannels(channels: DirectoryChannel[], channelMembers?: ChannelMembership[], syncedAt?: number): Promise<void>;
-  upsertGroups(groupMembers: GroupMembership[], syncedAt?: number): Promise<void>;
+  upsertChannels(
+    channels: DirectoryChannel[],
+    channelMembers?: ChannelMembership[],
+    syncedAt?: number,
+    channelRosterIds?: string[],
+    revocations?: ChannelMembership[],
+  ): Promise<void>;
+  upsertGroups(
+    groupMembers: GroupMembership[],
+    syncedAt?: number,
+    groupIds?: string[],
+    groupRosterIds?: string[],
+  ): Promise<void>;
   setDirectoryWorkspaceUrl(url: string): Promise<void>;
   directoryMeta(): Promise<DirectoryMeta>;
   resolveRecipient(query: string): Promise<RecipientResolution>;
@@ -486,6 +517,7 @@ export interface AppDeps {
   identity: IdentityService;
   publicWebUrl?: string;
   sessions: SessionStore;
+  screenSecurity?: SecurityScreenProbe;
   orchestrator: Orchestrator;
   runs: RunStore;
   leaseTtlMs: number;
@@ -497,6 +529,7 @@ export interface AppDeps {
   tasks?: TaskStore;
   modelGateway: ModelGateway;
   modelCredentials?: ModelCredentialStore;
+  userModelCredentials?: UserModelCredentialStore;
   mcpServers?: McpServerStore;
   mcpToolService?: McpToolService;
   modelCredentialFetch?: typeof fetch;
@@ -512,8 +545,10 @@ export interface AppDeps {
   auditLog: AuditLog;
   config: ScopedConfigStore;
   crons: CronStore;
+  webhooks: WebhookStore;
   deliveries: DeliveryStore;
   directory: DirectoryStore;
+  emailAuthMembers?: DirectoryMember[];
   projects?: ProjectStore;
   deploy: DeployService;
   deploymentLayer?: DeploymentLayerRuntime;
@@ -592,6 +627,7 @@ interface ScopeSkill {
 
 interface ScopeResources {
   files: FileListItem[];
+  webhooks: Webhook[];
   crons: Cron[];
   deployments: ScopeDeployment[];
   skills: ScopeSkill[];

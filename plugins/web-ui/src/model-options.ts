@@ -9,6 +9,7 @@ export interface ModelOption {
   model: Model<Api>;
   label: string;
   buttonLabel: string;
+  groupLabel: string;
 }
 
 interface ModelMeta {
@@ -36,6 +37,10 @@ const MODEL_CATALOG: Record<string, ModelMeta> = {
   "claude-fable-5": {
     label: "Fable 5",
     buttonLabel: "Fable 5",
+  },
+  "gpt-6-astra": {
+    label: "GPT-6 Astra",
+    buttonLabel: "Astra",
   },
   "gpt-5.6-sol": {
     label: "GPT-5.6 Sol",
@@ -74,6 +79,32 @@ const HARNESS_LABELS: Record<string, string> = {
   mock: "Mock",
 };
 
+const PROVIDER_LABELS: Record<string, string> = {
+  anthropic: "Anthropic",
+  openai: "OpenAI",
+  openrouter: "OpenRouter",
+  google: "Google",
+  "arcee-ai": "Arcee AI",
+  "meta-llama": "Meta",
+  mistralai: "Mistral AI",
+};
+
+function providerLabel(id: string, name: string, provider: string): string {
+  if (provider === "openrouter") {
+    const namedProvider = /^([^:]{2,40}):\s/.exec(name)?.[1]?.trim();
+    if (namedProvider) return namedProvider;
+  }
+  const key = provider === "openrouter" ? (id.split("/", 1)[0] ?? provider) : provider;
+  return (
+    PROVIDER_LABELS[key] ??
+    key
+      .split(/[-_]/)
+      .filter(Boolean)
+      .map((part) => part[0]!.toUpperCase() + part.slice(1))
+      .join(" ")
+  );
+}
+
 function buildOption(
   id: string,
   harnessId = "pi",
@@ -91,6 +122,7 @@ function buildOption(
       harnessLabel: HARNESS_LABELS[harnessId] ?? harnessId,
       model,
       ...meta,
+      groupLabel: providerLabel(id, meta.label, dynamic?.provider ?? String(model.provider ?? model.api ?? "other")),
     };
   } catch {
     return null;

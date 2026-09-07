@@ -7,6 +7,7 @@ import {
   retention,
   whoami,
 } from "./admin/scope-config.ts";
+import { testAutoFlagger } from "./admin/auto-flagger-test.ts";
 import { egress, listAdminAudit, listAdminErrors, listAdminRuns, metrics } from "./admin/observability.ts";
 import { getAdminSession, getAdminSessionLlm, listAdminSessions, listAdminShadowDeliveries } from "./admin/sessions.ts";
 import { downloadAdminFile, listAdminFiles, readAdminFile, uploadAdminFile } from "./admin/files.ts";
@@ -16,10 +17,12 @@ import { listSandboxRoutes, migrateSandboxScope } from "./admin/sandbox.ts";
 import {
   createAdminGrant,
   getUserDetail,
+  inviteExternalUser,
   listKeychainStatus,
   listUsers,
   resetUserToBrandNew,
   revokeAdminGrant,
+  revokeExternalUser,
   searchDirectory,
   setUserOnboarding,
   startImpersonation,
@@ -31,10 +34,16 @@ import {
   listSlackMirrorContainers,
   listSlackMirrorMessages,
 } from "./admin/slack-mirror.ts";
-import { deleteSlackInstallation, getSlackInstallation, putSlackInstallation } from "./admin/slack-installation.ts";
+import {
+  deleteSlackInstallation,
+  getSlackEmojiList,
+  getSlackInstallation,
+  putSlackInstallation,
+} from "./admin/slack-installation.ts";
 import { deleteModelProvider, getModelProviders, putModelProvider } from "./admin/model-providers.ts";
 import { deleteCustomProvider, getCustomProviders, putCustomProvider } from "./admin/custom-providers.ts";
 import { deleteMcpServer, getMcpServers, putMcpServer } from "./admin/mcp-servers.ts";
+import { listSecurityFlags, releaseSecurityTaint } from "./admin/security.ts";
 
 const timed =
   (handle: (ctx: ApiCtx) => void | Promise<void>) =>
@@ -55,6 +64,7 @@ const timed =
 
 const routes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/admin/slack-installation", auth: "either", handle: getSlackInstallation },
+  { method: "GET", path: "/v1/admin/slack-emoji", auth: "either", handle: getSlackEmojiList },
   { method: "PUT", path: "/v1/admin/slack-installation", auth: "either", handle: putSlackInstallation },
   { method: "DELETE", path: "/v1/admin/slack-installation", auth: "either", handle: deleteSlackInstallation },
   { method: "GET", path: "/v1/admin/model-providers", auth: "either", handle: getModelProviders },
@@ -66,6 +76,12 @@ const routes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/admin/custom-providers", auth: "either", handle: getCustomProviders },
   { method: "PUT", path: "/v1/admin/custom-providers/:provider", auth: "either", handle: putCustomProvider },
   { method: "DELETE", path: "/v1/admin/custom-providers/:provider", auth: "either", handle: deleteCustomProvider },
+  {
+    method: "POST",
+    path: "/v1/admin/scopes/:scope/auto-flagger/test",
+    auth: "either",
+    handle: testAutoFlagger,
+  },
   { method: "PUT", path: "/v1/admin/scopes/:scope/:resource", auth: "either", handle: putScopeConfig },
   { method: "GET", path: "/v1/admin/whoami", auth: "either", handle: whoami },
   { method: "GET", path: "/v1/admin/scopes", auth: "either", handle: listAdminScopes },
@@ -89,6 +105,8 @@ const routes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/admin/files", auth: "either", handle: listAdminFiles },
   { method: "GET", path: "/v1/admin/errors", auth: "either", handle: listAdminErrors },
   { method: "GET", path: "/v1/admin/audit", auth: "either", handle: listAdminAudit },
+  { method: "GET", path: "/v1/admin/security/flags", auth: "either", handle: listSecurityFlags },
+  { method: "POST", path: "/v1/admin/security/release", auth: "either", handle: releaseSecurityTaint },
   {
     match: (m, p) =>
       m === "GET" && (p === "/v1/admin/crons" || p === "/v1/admin/deployments" || p === "/v1/admin/skills"),
@@ -111,6 +129,8 @@ const routes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "POST", path: "/v1/admin/users/:principalId/reset", auth: "either", handle: resetUserToBrandNew },
   { method: "POST", path: "/v1/admin/grants", auth: "either", handle: createAdminGrant },
   { method: "DELETE", path: "/v1/admin/grants/:principalId", auth: "either", handle: revokeAdminGrant },
+  { method: "POST", path: "/v1/admin/external-users", auth: "either", handle: inviteExternalUser },
+  { method: "DELETE", path: "/v1/admin/external-users/:email", auth: "either", handle: revokeExternalUser },
   { method: "POST", path: "/v1/admin/impersonate/stop", auth: "either", handle: stopImpersonation },
   { method: "POST", path: "/v1/admin/impersonate", auth: "either", handle: startImpersonation },
 ];
