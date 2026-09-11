@@ -16,13 +16,14 @@ function resolveView(pathname: string, search: string): string {
   const src = [
     slice("const SECTIONS = [", "const DISABLED_VIEWS"),
     slice("const DEFAULT_VIEW = ", ";") + ";",
-    slice("function urlToState() {", "let transcriptObserver"),
+    slice("function decodePathSegment(seg) {", "let transcriptObserver"),
     "urlToState().view;",
   ].join("\n");
   const context = vm.createContext({
     URLSearchParams,
     API_BASE: "/admin",
     scope: "org",
+    orgId: "acme",
     location: { pathname, search },
   });
   return vm.runInContext(src, context);
@@ -63,6 +64,7 @@ async function runLoadOnboarding(modelProviders: unknown): Promise<Record<string
         },
       }),
     api: async (_method: string, path: string) => ({ ok: true, data: fixtures[path] ?? {} }),
+    loadModelRegistry: async () => {},
     orgScope: () => "org:default-org",
     encodeURIComponent,
     setStatus: () => {},
@@ -120,10 +122,6 @@ test("a stored key keeps its summary even when the harness also carries auth", a
   assert.equal(elements["onboarding-model-summary"]!.textContent, "claude-opus-5 · admin-managed key");
 });
 
-test("onboarding is a navigable view", () => {
-  assert.match(html, /\{ label: "Admin", views: \["onboarding",/);
-});
-
 test("/admin/onboarding resolves to the onboarding view", () => {
   assert.equal(resolveView("/admin/onboarding", ""), "onboarding");
 });
@@ -134,4 +132,35 @@ test("?view=onboarding resolves to the onboarding view", () => {
 
 test("unknown views still fall back to the default view", () => {
   assert.equal(resolveView("/admin/no-such-view", ""), "history");
+});
+
+test("model registry verification makes charges and credential scope explicit", () => {
+  assert.match(html, /id="model-registry-save" disabled>Verify and enable/);
+  const notice = slice('id="model-registry-verification-notice"', "</p>");
+  assert.match(notice, /provider charge/);
+  assert.match(notice, /personal-key access/);
+  const save = slice('$("model-registry-save").onclick', "let customProvidersLoaded");
+  assert.match(save, /verify: true/);
+  assert.match(save, /el.disabled = true/);
+  assert.match(save, /Verifying…/);
+  assert.match(save, /finally/);
+  assert.match(save, /el.disabled = disabled/);
+  assert.match(html, /Verified with organization credentials/);
+});
+
+test("model setup starts with two inputs, separates missing fields and discards stale lookups", () => {
+  const form = slice(
+    '<label\n                  >Provider\n                  <select id="model-registry-provider">',
+    'id="model-registry-result"',
+  );
+  assert.match(form, /model-registry-id/);
+  assert.doesNotMatch(form, /model-registry-contextWindow|model-registry-input/);
+  assert.match(html, /<summary>Advanced overrides<\/summary>/);
+  assert.match(html, /id="model-registry-missing-fields"/);
+  const code = slice("let modelRegistryTemplates = []", "let customProvidersLoaded");
+  assert.match(code, /request !== modelRegistryLookupRequest/);
+  assert.match(code, /\$\("model-registry-id"\)\.oninput = resetRegistryLookup/);
+  assert.match(code, /JSON\.stringify\(identity\) !== JSON\.stringify\(lookup.identity\)/);
+  assert.match(code, /Choose a compatible template/);
+  assert.match(code, /source/);
 });

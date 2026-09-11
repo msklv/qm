@@ -9,6 +9,27 @@ function pat(method: string, template: string, field?: Field): Rule {
 }
 
 const USER_SCOPED: Rule[] = [
+  pat("POST", "/v1/auth/broker/sessions/revoke"),
+  pat("POST", "/v1/loops", { in: "query", name: "principalId" }),
+  pat("GET", "/v1/loops", { in: "query", name: "principalId" }),
+  pat("GET", "/v1/loops/:id", { in: "query", name: "principalId" }),
+  pat("PATCH", "/v1/loops/:id", { in: "query", name: "principalId" }),
+  pat("DELETE", "/v1/loops/:id", { in: "query", name: "principalId" }),
+  pat("POST", "/v1/loops/:id/fire", { in: "query", name: "principalId" }),
+  pat("POST", "/v1/loops/:id/outputs/:outputId/decide", { in: "query", name: "principalId" }),
+  pat("POST", "/v1/loops/:id/grants", { in: "query", name: "principalId" }),
+  pat("POST", "/v1/loops/:id/autopilot", { in: "query", name: "principalId" }),
+  pat("DELETE", "/v1/loops/:id/grants/:grantId", { in: "query", name: "principalId" }),
+  pat("GET", "/v1/loops/inbox", { in: "query", name: "principalId" }),
+  pat("POST", "/v1/loops/inbox/sync-cron", { in: "query", name: "principalId" }),
+  pat("GET", "/v1/loops/:id/items", { in: "query", name: "principalId" }),
+  pat("POST", "/v1/loops/:id/items", { in: "query", name: "principalId" }),
+  pat("GET", "/v1/loops/:id/items/:itemId", { in: "query", name: "principalId" }),
+  pat("POST", "/v1/loops/:id/items/:itemId/action", { in: "query", name: "principalId" }),
+  pat("POST", "/v1/loops/:id/items/:itemId/followup", { in: "query", name: "principalId" }),
+  pat("POST", "/v1/sessions/:id/share", { in: "body", name: "principalId" }),
+  pat("GET", "/v1/shared-sessions/:token", { in: "query", name: "viewer" }),
+  pat("GET", "/v1/shared-sessions/:token/files/:fileId", { in: "query", name: "viewer" }),
   pat("GET", "/v1/sessions/search", { in: "query", name: "principalId" }),
   pat("GET", "/v1/sessions/:id", { in: "query", name: "viewer" }),
   pat("GET", "/v1/sessions/:id/entries/:seq", { in: "query", name: "viewer" }),
@@ -17,6 +38,12 @@ const USER_SCOPED: Rule[] = [
   pat("GET", "/v1/sessions/:id/background/:pid/output", { in: "query", name: "viewer" }),
   pat("GET", "/v1/files/:id/content", { in: "query", name: "viewer" }),
   pat("GET", "/v1/files", { in: "query", name: "viewer" }),
+  pat("GET", "/v1/files/upload-client", { in: "query", name: "viewer" }),
+  pat("POST", "/v1/files/uploads", { in: "body", name: "principalId" }),
+  pat("GET", "/v1/files/uploads/:id", { in: "query", name: "viewer" }),
+  pat("POST", "/v1/files/uploads/:id/parts/:part", { in: "body", name: "principalId" }),
+  pat("POST", "/v1/files/uploads/:id/complete", { in: "body", name: "principalId" }),
+  pat("DELETE", "/v1/files/uploads/:id", { in: "body", name: "principalId" }),
   pat("POST", "/v1/files/upload", { in: "body", name: "principalId" }),
   pat("POST", "/v1/sessions/:id", { in: "body", name: "principalId" }),
   pat("POST", "/v1/sessions/:id/title", { in: "body", name: "principalId" }),
@@ -102,6 +129,8 @@ const SYSTEM: Rule[] = [
   pat("POST", "/v1/blobs"),
   pat("POST", "/v1/egress-audit"),
   pat("POST", "/v1/auth/broker/claim"),
+  pat("POST", "/v1/auth/broker/sessions"),
+  pat("POST", "/v1/auth/broker/sessions/use"),
   pat("PUT", "/v1/deployment-layer"),
   pat("POST", "/v1/session-cap"),
   pat("POST", "/v1/keychain/drops/:id"),
@@ -131,7 +160,7 @@ export function userScopedField(method: string, pathname: string): Field | undef
 export function isUnclassifiedWrite(method: string, pathname: string): boolean {
   if (!WRITE.has(method)) return false;
   if (pathname.startsWith("/v1/admin/")) return false;
-  if (userScopedField(method, pathname)) return false;
+  if (isUserScoped(method, pathname)) return false;
   return !SYSTEM.some((r) => r.method === method && r.re.test(pathname));
 }
 

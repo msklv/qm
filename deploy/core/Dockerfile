@@ -5,6 +5,7 @@ RUN apk add --no-cache ca-certificates curl git git-daemon docker-cli
 WORKDIR /app
 
 COPY package.json package-lock.json ./
+COPY .husky/install.mjs .husky/install.mjs
 RUN npm ci --omit=dev && npm audit --omit=dev --audit-level=moderate \
   && rm -rf /root/.npm /tmp/node-compile-cache
 
@@ -22,5 +23,6 @@ ENV GIT_SHA=$GIT_SHA
 RUN mkdir -p /data && chown node:node /data
 EXPOSE 8080
 
+RUN apk add --no-cache util-linux
 USER node
 CMD ["node", "src/index.ts"]

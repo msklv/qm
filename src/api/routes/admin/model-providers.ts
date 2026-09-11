@@ -1,4 +1,4 @@
-import { isModelProvider, type ModelProvider } from "../../../model/pi-models.ts";
+import { isModelProvider, type ModelProvider } from "../../../model/model-credential-store.ts";
 import { providerBaseUrl } from "../../../model/provider-endpoints.ts";
 import { selectableModelCatalog } from "../../../model/model-catalog.ts";
 import { sendJson } from "../../http.ts";
@@ -51,6 +51,7 @@ export async function validateProviderApiKey(ctx: ApiCtx, provider: ModelProvide
 export async function getModelProviders(ctx: ApiCtx): Promise<void> {
   const authorized = await actor(ctx);
   if (!authorized) return;
+  await ctx.deps.refreshModels?.();
   if (!ctx.deps.modelCredentials) return sendJson(ctx.res, 404, { error: "not_found" });
   audit(ctx.deps, {
     principalId: authorized.id,

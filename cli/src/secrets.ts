@@ -1,5 +1,5 @@
-import { isVirtualService, type DeclaredServiceName } from "./services.ts";
-import type { ModelProvider, QmConfig } from "./config.ts";
+import { serviceHost, type DeclaredServiceName } from "./services.ts";
+import { effectiveModelProvider, type ModelProvider, type QmConfig } from "./config.ts";
 import { TARGET_ENV_DEFAULTS } from "./target-env-defaults.ts";
 import { deploymentSecretValue } from "./util.ts";
 
@@ -112,14 +112,6 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
     generate: MINT_LOCALLY,
   },
   {
-    name: "FLY_SANDBOX_API_TOKEN",
-    service: "core",
-    envName: "FLY_API_TOKEN",
-    required: { when: { kind: "target", target: "fly" } },
-    description: "Fly deploy token scoped to the agent-computer app.",
-    generate: "fly tokens create deploy -a <sandbox-app> -x 8760h",
-  },
-  {
     name: "FLY_DEPLOY_API_TOKEN",
     service: "core",
     required: { when: { kind: "env-equals", service: "core", name: "DEPLOY_PROVIDER", value: "fly" } },
@@ -151,6 +143,25 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
     generate: "sprite login   # then copy the token from ~/.sprite/credentials",
   },
   {
+    name: "E2B_API_KEY",
+    service: "core",
+    required: { when: { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "e2b" } },
+    description: "E2B API key used by the e2b sandbox backend (from e2b.dev dashboard).",
+  },
+  {
+    name: "MODAL_TOKEN_ID",
+    service: "core",
+    required: { when: { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "modal" } },
+    description: "Modal token id used by the modal sandbox backend.",
+    generate: "modal token new   # or create a token in the Modal dashboard",
+  },
+  {
+    name: "MODAL_TOKEN_SECRET",
+    service: "core",
+    required: { when: { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "modal" } },
+    description: "Modal token secret paired with MODAL_TOKEN_ID.",
+  },
+  {
     name: "SMOLMACHINES_TOKEN",
     service: "core",
     required: { when: { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "smolmachines" } },
@@ -178,6 +189,18 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
     required: { when: { kind: "target", target: "aws" } },
     description: "Postgres connection string for durable state.",
     managedBy: "terraform",
+  },
+  {
+    name: "DATABASE_POOL_URL",
+    service: "core",
+    required: false,
+    description: "Transaction-mode PgBouncer URL using the direct database's company credentials and database name.",
+  },
+  {
+    name: "DATABASE_POOL_CA_CERT",
+    service: "core",
+    required: false,
+    description: "PEM CA certificate used to verify the transaction pooler's TLS identity.",
   },
   {
     name: "DATABASE_CA_CERT",
@@ -468,7 +491,7 @@ function conditionMatches(config: QmConfig, condition: SecretCondition): boolean
   if (condition.kind === "all") return condition.conditions.every((nested) => conditionMatches(config, nested));
   if (condition.kind === "any") return condition.conditions.some((nested) => conditionMatches(config, nested));
   if (condition.kind === "target") return config.target === condition.target;
-  if (condition.kind === "model-provider") return config.modelProvider === condition.provider;
+  if (condition.kind === "model-provider") return effectiveModelProvider(config) === condition.provider;
   if (condition.kind === "env-all-absent") {
     return condition.names.every((name) => !config.env[condition.service]?.[name]?.trim());
   }
@@ -533,7 +556,8 @@ export function computedSecrets(config: QmConfig): ComputedSecret[] {
   }
   for (const plugin of config.plugins) {
     const signing = byName.get("CORE_SIGNING_SECRET");
-    if (signing && !signing.services.includes(plugin.name)) signing.services.push(plugin.name);
+    if (plugin.coreAccess !== false && signing && !signing.services.includes(plugin.name))
+      signing.services.push(plugin.name);
     for (const spec of plugin.secrets ?? []) {
       const required = spec.required !== false;
       const current = byName.get(spec.name);
@@ -588,7 +612,7 @@ export function computedSecrets(config: QmConfig): ComputedSecret[] {
       });
     }
   }
-  return [...byName.values()]
+  const secrets = [...byName.values()]
     .map((secret) => ({
       ...secret,
       services: [...secret.services].sort(),
@@ -601,6 +625,25 @@ export function computedSecrets(config: QmConfig): ComputedSecret[] {
         : {}),
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
+  return secrets;
+}
+
+export function validatedSecrets(config: QmConfig): ComputedSecret[] {
+  const secrets = computedSecrets(config);
+  const delivered = new Map<string, string>();
+  for (const secret of secrets) {
+    for (const [workload, names] of secretDestinations(secret)) {
+      for (const name of names) {
+        const key = `${workload}:${name}`;
+        const prior = delivered.get(key);
+        if (prior !== undefined && prior !== secret.name) {
+          throw new Error(`${workload} would receive env ${name} from both ${prior} and ${secret.name}`);
+        }
+        delivered.set(key, secret.name);
+      }
+    }
+  }
+  return secrets;
 }
 
 export function secretDestinations(
@@ -613,11 +656,10 @@ export function secretDestinations(
   };
   for (const service of secret.services) {
     if (service === "sandbox") add("core", `FLY_RESIDENT_ENV_${secret.name}`);
-    else if (isVirtualService(service)) add("core", secret.name);
-    else add(service, secret.name);
+    else add(serviceHost(service), secret.name);
   }
   for (const alias of secret.aliases ?? []) {
-    add(isVirtualService(alias.service) ? "core" : alias.service, alias.name);
+    add(serviceHost(alias.service), alias.name);
   }
   if (secret.name === "CORE_SIGNING_SECRET") {
     for (const plugin of pluginNames) add(plugin, secret.name);
@@ -630,7 +672,7 @@ export function runtimeSecretNames(
   secret: ComputedSecret,
   pluginNames: readonly string[] = [],
 ): string[] {
-  return [...(secretDestinations(secret, pluginNames).get(workload) ?? [])];
+  return [...(secretDestinations(secret, pluginNames).get(serviceHost(workload)) ?? [])];
 }
 
 export function secretsForService(
@@ -638,7 +680,7 @@ export function secretsForService(
   service: string,
   pluginNames: readonly string[] = [],
 ): ComputedSecret[] {
-  return computedSecrets(config).filter((secret) => secretDestinations(secret, pluginNames).has(service));
+  return computedSecrets(config).filter((secret) => secretDestinations(secret, pluginNames).has(serviceHost(service)));
 }
 
 export function serviceSecretValue(
@@ -648,7 +690,7 @@ export function serviceSecretValue(
   values: ReadonlyMap<string, string>,
 ): string | undefined {
   let value = config.env[service]?.[name];
-  for (const secret of secretsForService(config, service)) {
+  for (const secret of validatedSecrets(config)) {
     if (!runtimeSecretNames(service, secret).includes(name)) continue;
     const supplied = deploymentSecretValue(secret.name, values.get(secret.name));
     if (supplied !== undefined) value = supplied;
@@ -684,10 +726,7 @@ function conditionClause(condition: SecretCondition): string {
 }
 
 export function renderEnvExample(config: QmConfig): string {
-  const generate = (command: string): string =>
-    command
-      .replace("<sandbox-app>", config.sandbox?.app ?? "<sandbox-app>")
-      .replace("<fly-org>", config.flyOrg ?? "<fly-org>");
+  const generate = (command: string): string => command.replace("<fly-org>", config.flyOrg ?? "<fly-org>");
   const lines = [
     "# Secret values for this deployment. This file holds names only; copy it to .env and fill in",
     "# the values. .env is gitignored. `qm secrets push` transfers values without persisting",

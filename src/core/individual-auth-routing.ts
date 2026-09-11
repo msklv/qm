@@ -1,10 +1,13 @@
 import {
   codexSubscriptionModelId,
+  CODEX_SUBSCRIPTION_PROVIDER,
   DEFAULT_AGENT_MODEL_ID,
   DEFAULT_CODEX_MODEL_ID,
   defaultModelForHarness,
   defaultModelForProvider,
   resolveModel,
+  isOverlayModel,
+  modelUnavailableReason,
   type ModelProvider,
 } from "../model/pi-models.ts";
 import type { UserModelCredential } from "../model/user-model-credential-store.ts";
@@ -22,7 +25,9 @@ export function resolveIndividualAuthRouting(
   requestedModel: string | undefined,
   preferredHarness?: string,
 ): IndividualAuthRouting {
-  const requestedProvider = requestedModel ? resolveModel(requestedModel)?.provider : undefined;
+  if (requestedModel && (modelUnavailableReason(requestedModel) || !resolveModel(requestedModel))) return null;
+  const rawProvider = requestedModel ? resolveModel(requestedModel)?.provider : undefined;
+  const requestedProvider = rawProvider === CODEX_SUBSCRIPTION_PROVIDER ? "openai" : rawProvider;
   const pick = ((): { provider: "anthropic" | "openai"; cred: UserModelCredential } | null => {
     if (requestedProvider === "anthropic" && anthCred) return { provider: "anthropic", cred: anthCred };
     if (requestedProvider === "openai" && oaiCred) return { provider: "openai", cred: oaiCred };
@@ -31,6 +36,13 @@ export function resolveIndividualAuthRouting(
     return null;
   })();
   if (!pick) return null;
+  if (
+    requestedModel &&
+    isOverlayModel(requestedModel) &&
+    (pick.cred.kind !== "apikey" || requestedProvider !== pick.provider)
+  )
+    return null;
+  if (pick.cred.kind === "apikey" && rawProvider === CODEX_SUBSCRIPTION_PROVIDER) return null;
   if (pick.cred.kind === "apikey" && pick.cred.apiKey) {
     return {
       kind: "apikey",
@@ -49,7 +61,10 @@ export function resolveIndividualAuthRouting(
         kind: "oauth",
         provider: "anthropic",
         harness: "claude",
-        model: defaultModelForHarness("claude", DEFAULT_AGENT_MODEL_ID),
+        model:
+          requestedModel && requestedProvider === "anthropic"
+            ? requestedModel
+            : defaultModelForHarness("claude", DEFAULT_AGENT_MODEL_ID),
       };
     }
     if (preferredHarness === "pi") {
@@ -69,7 +84,10 @@ export function resolveIndividualAuthRouting(
       kind: "oauth",
       provider: "openai",
       harness: "codex",
-      model: defaultModelForHarness("codex", DEFAULT_CODEX_MODEL_ID),
+      model:
+        requestedModel && requestedProvider === "openai"
+          ? requestedModel.replace(/^codex\//, "")
+          : defaultModelForHarness("codex", DEFAULT_CODEX_MODEL_ID),
     };
   }
   return null;

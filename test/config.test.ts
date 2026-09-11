@@ -1,7 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { resolve } from "node:path";
-import { baseModelProviders, boolEnv, loadConfig, numEnv, CONFIG_DEFAULTS } from "../src/config.ts";
+import {
+  harnessCarriedModelAuth,
+  baseModelProviders,
+  boolEnv,
+  loadConfig,
+  numEnv,
+  CONFIG_DEFAULTS,
+} from "../src/config.ts";
 
 const productionEnv = {
   NODE_ENV: "production",
@@ -153,6 +160,16 @@ test("harness security posture defaults to auto and validates named modes", () =
   );
 });
 
+test("sharing posture defaults to isolated and accepts only isolated or open", () => {
+  assert.equal(loadConfig({}).sharingPosture, "isolated");
+  assert.equal(loadConfig({ HARNESS_SHARING_POSTURE: "Open" }).sharingPosture, "open");
+  assert.equal(loadConfig({ HARNESS_SHARING_POSTURE: "isolated" }).sharingPosture, "isolated");
+  assert.throws(
+    () => loadConfig({ HARNESS_SHARING_POSTURE: "dangerous" }),
+    /HARNESS_SHARING_POSTURE="dangerous" is not recognized/,
+  );
+});
+
 test("production names a mock harness rather than letting it pass as a real deployment", () => {
   const warnings: string[] = [];
   const original = console.warn;
@@ -188,7 +205,13 @@ test("boolEnv: one vocabulary for every boolean env knob", () => {
 });
 
 test("every boolean knob accepts the shared vocabulary (off means off)", () => {
-  const off = loadConfig({ SEED_SKILLS: "off", EXECUTE_SCRATCH: "off", REACH_EXEC: "off", PI_CAPTURE_REQUESTS: "off" });
+  const off = loadConfig({
+    SEED_SKILLS: "off",
+    EXECUTE_SCRATCH: "off",
+    REACH_EXEC: "off",
+    COMMAND_SCOPED_CREDENTIALS: "off",
+    PI_CAPTURE_REQUESTS: "off",
+  });
   assert.equal(off.seedSkills, false);
   assert.equal(off.scratchExecEnabled, false);
   assert.equal(off.reachExecEnabled, false);
@@ -227,6 +250,15 @@ test("a set-but-unparseable env value refuses to boot instead of silently taking
   assert.throws(() => loadConfig({ SANDBOX_BACKEND: "docker" }), /SANDBOX_BACKEND="docker" is not recognized/);
   assert.equal(loadConfig({ WORKERS: "  " }).workers, CONFIG_DEFAULTS.workers);
   assert.equal(loadConfig({ EXECUTE_SCRATCH: "" }).scratchExecEnabled, false);
+});
+
+test("Slack HTTP ingress exposes only a valid configured receiver port", () => {
+  assert.equal(loadConfig({ SLACK_EVENTS_MODE: "http", SLACK_EVENTS_PORT: "8182" }).slackEventsPort, 8182);
+  assert.equal(loadConfig({ SLACK_EVENTS_MODE: "socket", SLACK_EVENTS_PORT: "8182" }).slackEventsPort, undefined);
+  assert.throws(
+    () => loadConfig({ SLACK_EVENTS_MODE: "http", SLACK_EVENTS_PORT: "70000" }),
+    /SLACK_EVENTS_PORT must be an integer from 1 through 65535/,
+  );
 });
 
 test("sandbox backend is parsed once before production backend guards", () => {
@@ -344,28 +376,18 @@ test("HARNESS=claude uses native Claude authentication and does not require an A
   assert.equal(loadConfig({ HARNESS: "claude", CLAUDE_MODEL: "claude-opus-4-8" }).claudeModel, "claude-opus-4-8");
 });
 
-test("SANDBOX_BACKEND: unset defaults to local (dev only); the secondary must be recognized and differ", () => {
+test("SANDBOX_BACKEND: unset defaults to local (dev only); the retired secondary variable is tolerated", () => {
   assert.equal(loadConfig({}).sandboxBackend, "local");
   assert.throws(
     () => loadConfig({ ...productionEnv, SANDBOX_BACKEND: undefined }),
     /SANDBOX_BACKEND must be set explicitly in production/,
   );
-  assert.equal(loadConfig({}).sandboxSecondaryBackend, undefined);
-  assert.equal(
-    loadConfig({ SANDBOX_SECONDARY_BACKEND: "sprites", SPRITES_TOKEN: "tok" }).sandboxSecondaryBackend,
-    "sprites",
-  );
   assert.throws(() => loadConfig({ SANDBOX_BACKEND: "sprites" }), /SPRITES_TOKEN/);
   assert.throws(() => loadConfig({ SANDBOX_BACKEND: "agent37" }), /AGENT37_API_KEY/);
   assert.equal(loadConfig({ SANDBOX_BACKEND: "agent37", AGENT37_API_KEY: "sk_live_k" }).sandboxBackend, "agent37");
-  assert.throws(
-    () => loadConfig({ SANDBOX_SECONDARY_BACKEND: "fly" }),
-    /SANDBOX_SECONDARY_BACKEND="fly" is not recognized/,
-  );
-  assert.throws(
-    () => loadConfig({ SANDBOX_BACKEND: "sprites", SANDBOX_SECONDARY_BACKEND: "sprites", SPRITES_TOKEN: "tok" }),
-    /must differ/,
-  );
+  const config = loadConfig({ SANDBOX_SECONDARY_BACKEND: "smolmachines" });
+  assert.equal(config.sandboxBackend, "local");
+  assert.ok(!("sandboxSecondaryBackend" in config));
 });
 
 test("Fly identity and Slack runtime settings are parsed once into Config", () => {
@@ -615,5 +637,68 @@ test("the deploy-apps sign-in address defaults to the public web URL", () => {
   assert.throws(
     () => loadConfig({ DEPLOY_APPS_LOGIN_URL: "https://portal.example.com" }),
     /requires DEPLOY_APPS_SESSION_SECRET/,
+  );
+});
+
+test("Codex file OAuth satisfies model onboarding without an API key", () => {
+  const config = { ...loadConfig({}), harness: "codex" as const, codexAuthFile: "/local/auth.json" };
+  assert.equal(harnessCarriedModelAuth(config), "openai");
+  assert.equal(harnessCarriedModelAuth({ ...config, codexAuthFile: undefined }), undefined);
+});
+
+test("retired brain environment does not configure a runtime integration and warns once", () => {
+  const warnings: string[] = [];
+  const original = console.warn;
+  console.warn = (msg: unknown) => void warnings.push(String(msg));
+  let config;
+  try {
+    config = loadConfig({
+      BRAIN: "mcp",
+      BRAIN_MCP_URL: "https://unused.invalid",
+      BRAIN_RO_CLIENT_ID: "retired",
+      BRAIN_RO_CLIENT_SECRET: "retired",
+    });
+  } finally {
+    console.warn = original;
+  }
+  assert.deepEqual({ ...config, layerEnv: {} }, loadConfig({}));
+  const retired = warnings.filter((w) => w.includes("retired and ignored"));
+  assert.equal(retired.length, 1);
+  assert.match(retired[0]!, /BRAIN, BRAIN_MCP_URL, BRAIN_RO_CLIENT_ID are retired/);
+  assert.match(retired[0]!, /MEMORY_PROVIDER_CONFIG/);
+});
+
+test("Modal native retention and interval configuration are independent of legacy portable checkpoint throttling", () => {
+  const config = loadConfig({
+    MODAL_NATIVE_SNAPSHOT_INTERVAL_SEC: "60",
+    MODAL_SNAPSHOT_RETENTION_SEC: "86400",
+    MODAL_SNAPSHOT_INTERVAL_SEC: "315360000",
+  });
+  assert.equal(config.modalSandbox.nativeSnapshotIntervalSec, 60);
+  assert.equal(config.modalSandbox.snapshotRetentionSec, 86400);
+  assert.equal(config.modalSandbox.snapshotIntervalSec, 315360000);
+});
+
+test("Modal native activation is default-off and uses strict boolean configuration", () => {
+  assert.equal(loadConfig({}).modalSandbox.nativeSnapshotsEnabled, false);
+  for (const value of ["true", "on", "1"])
+    assert.equal(loadConfig({ MODAL_NATIVE_SNAPSHOTS_ENABLED: value }).modalSandbox.nativeSnapshotsEnabled, true);
+  assert.throws(() => loadConfig({ MODAL_NATIVE_SNAPSHOTS_ENABLED: "enable" }), /not a recognized boolean/);
+});
+
+test("direct Files initiation defaults off and requires explicit activation", () => {
+  assert.equal(loadConfig({}).filesDirectUploadsEnabled, false);
+  assert.equal(loadConfig({ FILES_DIRECT_UPLOADS_ENABLED: "true" }).filesDirectUploadsEnabled, true);
+  assert.equal(loadConfig({ FILES_DIRECT_UPLOADS_ENABLED: "false" }).filesDirectUploadsEnabled, false);
+  assert.throws(() => loadConfig({ FILES_DIRECT_UPLOADS_ENABLED: "maybe" }));
+});
+
+test("sandbox resource rollout requires explicit activation", () => {
+  assert.equal(loadConfig({ ...productionEnv }).sandboxResourcesEnabled, false);
+  for (const value of ["true", "on", "1"])
+    assert.equal(loadConfig({ ...productionEnv, SANDBOX_RESOURCES_ENABLED: value }).sandboxResourcesEnabled, true);
+  assert.throws(
+    () => loadConfig({ ...productionEnv, SANDBOX_RESOURCES_ENABLED: "enable" }),
+    /not a recognized boolean/,
   );
 });

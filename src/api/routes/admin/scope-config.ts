@@ -2,13 +2,16 @@ import { parseScopeId } from "../../../types.ts";
 import { encodeRef, serviceCredRef } from "../../../acl/resource-ref.ts";
 import { computeRetention } from "../../../admin/retention.ts";
 import {
+  FAST_MODE_MODEL_IDS,
+  harnessSupportsFastMode,
   HARNESS_IDS,
-  SELECTABLE_BASE_MODELS,
+  selectableBaseModels,
   defaultModelForHarness,
   modelProviderAvailabilityFor,
   modelServiceable,
   ALL_PROVIDERS_AVAILABLE,
   resolveModel,
+  thinkingLevelsForHarness,
 } from "../../../model/pi-models.ts";
 import {
   builtInModelCatalog,
@@ -33,7 +36,6 @@ import {
 } from "../../../policy/command-policy.ts";
 import { isHostDenied } from "../../../resolution/egress-policy.ts";
 import { discoverScopes } from "./common.ts";
-import { sessionCategory } from "./origins.ts";
 
 export async function putScopeConfig(ctx: ApiCtx): Promise<void> {
   const { res, deps, params, body } = ctx;
@@ -43,6 +45,8 @@ export async function putScopeConfig(ctx: ApiCtx): Promise<void> {
 
   const actor = await authorizeAdmin(ctx, targetScope);
   if (!actor) return;
+  if (["base-model", "runtime", "webui-models", "browse-model", "auto-flagger", "import"].includes(resource))
+    await deps.refreshModels?.();
   const withScopeMutationLock = async <T>(fn: () => Promise<T>): Promise<T> =>
     deps.advisoryLock ? deps.advisoryLock.withLock(`admin-governance:${targetScope}`, fn) : fn();
 
@@ -108,6 +112,7 @@ export async function getAdminResources(ctx: ApiCtx): Promise<void> {
   const scope = orgScope(deps);
   const actor = await authorizeAdmin(ctx, scope);
   if (!actor) return;
+  await deps.refreshModels?.();
   audit(deps, { principalId: actor.id, action: "resources.read", resource: "resources", scopeLabel: scope });
   return sendJson(res, 200, { resources: adminResourceManifest() });
 }
@@ -164,54 +169,32 @@ export async function listAdminScopes(ctx: ApiCtx): Promise<void> {
     for (const id of ids) m.set(id, (m.get(id) ?? 0) + 1);
     return m;
   };
-  const summaries = (await deps.sessions?.scopeSessionSummaries(scope, true, undefined, false)) ?? [];
-  const conversationSummaries = summaries.filter((s) => sessionCategory(s) === "conversation");
-  const backgroundSummaries = summaries.filter((s) => sessionCategory(s) === "background");
-  const sessionN = countBy(conversationSummaries.map((s) => s.scopeId));
-  const backgroundN = countBy(backgroundSummaries.map((s) => s.scopeId));
-  const lastActivityBy = new Map<string, number>();
-  for (const s of summaries)
-    lastActivityBy.set(s.scopeId, Math.max(lastActivityBy.get(s.scopeId) ?? 0, s.lastActivity));
-  const lastConversationBy = new Map<string, number>();
-  const winnerBy = new Map<string, { at: number; sessionId: string }>();
-  for (const s of conversationSummaries) {
-    lastConversationBy.set(s.scopeId, Math.max(lastConversationBy.get(s.scopeId) ?? 0, s.lastActivity));
-    if (s.turns > 0) {
-      const prev = winnerBy.get(s.scopeId);
-      if (!prev || s.lastActivity > prev.at) winnerBy.set(s.scopeId, { at: s.lastActivity, sessionId: s.id });
-    }
-  }
-  const previews =
-    (await deps.sessions?.lastUserMessages([...winnerBy.values()].map((w) => w.sessionId))) ??
-    new Map<string, string>();
-  const lastMessageBy = new Map<string, string>();
-  for (const [scopeId, w] of winnerBy) {
-    const text = previews.get(w.sessionId);
-    if (text) lastMessageBy.set(scopeId, text);
-  }
+  const rollups = (await deps.sessions?.scopeSessionRollups(scope, true)) ?? [];
+  const rollupBy = new Map(rollups.map((r) => [r.scopeId, r]));
+  const previewIds = rollups.flatMap((r) => (r.previewSessionId ? [r.previewSessionId] : []));
+  const previews = (await deps.sessions?.lastUserMessages(previewIds)) ?? new Map<string, string>();
   const cronN = countBy(crons.map((c) => c.ownerScopeId));
   const deployN = countBy(deployments.map((d) => d.ownerScopeId));
   const skillN = countBy(skills.map((s) => s.scopeId));
   const scopes = [...labels].map(([id, label]) => {
-    const environment = environmentById.get(id);
-    const attachment = attachmentByScope.get(id);
+    const rollup = rollupBy.get(id);
     return {
       scopeId: id,
       ...(label ? { label } : {}),
-      ...(environment?.name ? { environmentName: environment.name } : {}),
-      ...(attachment
+      ...(environmentById.get(id)?.name ? { environmentName: environmentById.get(id)!.name } : {}),
+      ...(attachmentByScope.has(id)
         ? {
             environmentAttachment: {
-              environmentId: attachment.id,
-              environmentName: attachment.name,
+              environmentId: attachmentByScope.get(id)!.id,
+              environmentName: attachmentByScope.get(id)!.name,
             },
           }
         : {}),
-      sessions: sessionN.get(id) ?? 0,
-      backgroundSessions: backgroundN.get(id) ?? 0,
-      lastActivity: lastActivityBy.get(id) ?? 0,
-      lastConversationActivity: lastConversationBy.get(id) ?? 0,
-      lastMessage: lastMessageBy.get(id) ?? "",
+      sessions: rollup?.sessions ?? 0,
+      backgroundSessions: rollup?.backgroundSessions ?? 0,
+      lastActivity: rollup?.lastActivity ?? 0,
+      lastConversationActivity: rollup?.lastConversationActivity ?? 0,
+      lastMessage: (rollup?.previewSessionId && previews.get(rollup.previewSessionId)) || "",
       crons: cronN.get(id) ?? 0,
       deployments: deployN.get(id) ?? 0,
       skills: skillN.get(id) ?? 0,
@@ -262,6 +245,7 @@ export async function getScopeConfig(ctx: ApiCtx): Promise<void> {
   if (!targetScope || targetScope.includes("/")) return sendJson(res, 404, { error: "not_found" });
   const actor = await authorizeAdmin(ctx, targetScope);
   if (!actor) return;
+  await deps.refreshModels?.();
   await deps.config.refreshScope(targetScope);
   audit(deps, { principalId: actor.id, action: "config.read", resource: "config", scopeLabel: targetScope });
   const environmentMetadata = await scopeEnvironmentMetadata(deps, targetScope);
@@ -286,6 +270,7 @@ export async function getScopeConfig(ctx: ApiCtx): Promise<void> {
   for (const r of ADMIN_RESOURCES) {
     if (r.readKey && r.get) values[r.readKey] = await r.get(deps, targetScope);
   }
+  values.sharingPostureOverride = await deps.config.getSharingPostureOwnDurable(targetScope);
   const scopeProfile = (await deps.sandbox?.profileFor?.(targetScope)) ?? deps.sandbox?.profile;
   const declaredEgress =
     scopeProfile?.egressEnforcement ?? deps.egressDeclaredEnforcement ?? deps.egressEnforcement ?? "none";
@@ -311,6 +296,7 @@ export async function getScopeConfig(ctx: ApiCtx): Promise<void> {
       ? await selectableModelCatalog(deps.modelCredentialFetch)
       : builtInModelCatalog();
   const runtime = values.runtime as { harnessId?: unknown; modelId?: unknown } | null | undefined;
+  const approvedHarnesses = (await deps.config.getApprovedHarnessesDurable()) ?? [deps.harnessId ?? "pi"];
   const resolvedCurrent = runtime && typeof runtime.modelId === "string" ? resolveModel(runtime.modelId) : null;
   const currentProvider = resolvedCurrent?.provider;
   const currentModel =
@@ -323,7 +309,11 @@ export async function getScopeConfig(ctx: ApiCtx): Promise<void> {
     const models = selectableCatalogForHarness(catalog, harnessId);
     if (currentModel && runtime?.harnessId === harnessId && !models.some((model) => model.id === currentModel.id))
       models.push(currentModel);
-    return models.filter((model) => modelServiceable(model.id, providersFor(harnessId)));
+    return models.filter(
+      (model) =>
+        modelServiceable(model.id, providersFor(harnessId)) ||
+        (runtime?.harnessId === harnessId && currentModel?.id === model.id),
+    );
   };
   return sendJson(res, 200, {
     scopeId: targetScope,
@@ -335,10 +325,17 @@ export async function getScopeConfig(ctx: ApiCtx): Promise<void> {
     baseModelDefault: defaultModelForHarness(deps.harnessId ?? "pi", deps.baseModelDefault),
     baseModelOptions: modelsFor(deps.harnessId ?? "pi"),
     harnessDefault: deps.harnessId ?? "pi",
-    harnessOptions: HARNESS_IDS.filter((id) => id !== "mock"),
+    harnessOptions: HARNESS_IDS.filter(
+      (id) => id !== "mock" && (approvedHarnesses.includes(id) || runtime?.harnessId === id),
+    ),
     modelsByHarness: Object.fromEntries(HARNESS_IDS.map((id) => [id, modelsFor(id)])),
+    thinkingLevelsByHarness: Object.fromEntries(
+      HARNESS_IDS.filter((id) => id !== "mock").map((id) => [id, thinkingLevelsForHarness(id)]),
+    ),
+    fastModeModelIds: FAST_MODE_MODEL_IDS,
+    fastModeHarnessIds: HARNESS_IDS.filter(harnessSupportsFastMode),
     autoFlaggerDefault: defaultAutoFlaggerConfig(deps),
-    browseModelOptions: SELECTABLE_BASE_MODELS.filter((m) =>
+    browseModelOptions: selectableBaseModels().filter((m) =>
       modelServiceable(m.id, providersFor(deps.harnessId ?? "pi")),
     ),
     egressEnforcement: {
@@ -363,9 +360,9 @@ export async function retention(ctx: ApiCtx): Promise<void> {
   const actor = await authorizeAdmin(ctx, scope);
   if (!actor) return;
   audit(deps, { principalId: actor.id, action: "retention.read", resource: "retention", scopeLabel: scope });
-  const sessions = (await deps.sessions?.listAll()) ?? [];
+  const sessionCount = (await deps.sessions?.countSessions()) ?? 0;
   const participants = (await deps.sessions?.listParticipants()) ?? [];
   const turns = (await deps.sessions?.attributedTurns()) ?? [];
-  const report = computeRetention({ sessions, participants, turns, nowMs: Date.now() });
+  const report = computeRetention({ sessionCount, participants, turns, nowMs: Date.now() });
   return sendJson(res, 200, { scopeId: scope, ...report });
 }

@@ -1,10 +1,11 @@
+import { pollProcess } from "../src/sandbox/process-poll.ts";
 import { test, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAgent37Sandbox } from "../src/sandbox/agent37-sandbox.ts";
-import { spriteScopeName } from "../src/sandbox/sprites-sandbox.ts";
+import { sandboxScopeName } from "../src/sandbox/exec-sandbox-base.ts";
 import { createLocalWorkspaceStore } from "../src/workspace/workspace-store.ts";
 import { supportsProcessSessions } from "../src/sandbox/sandbox.ts";
 import { scopeId } from "../src/types.ts";
@@ -87,17 +88,10 @@ test("process sessions capability works end to end", async () => {
   if (!supportsProcessSessions(sandbox)) return;
   const h = await sandbox.provision(layers);
   const { processId } = await sandbox.startProcess(h, "echo one; echo two");
-  let cursor = 0,
-    chunks = "",
-    state = "running";
-  for (let i = 0; i < 10 && state === "running"; i++) {
-    const r = await sandbox.readProcess(h, processId, { sinceCursor: cursor });
-    chunks += r.chunks;
-    cursor = r.cursor;
-    state = r.status.state;
-  }
-  assert.match(chunks, /one/);
-  assert.match(chunks, /two/);
+  const { output, status } = await pollProcess(sandbox, h, processId, { deadlineMs: 5_000, waitMs: 100 });
+  assert.equal(status.state, "exited");
+  assert.match(output, /one/);
+  assert.match(output, /two/);
 });
 
 test("force-through proxy env is set when a proxy url and token are present", async () => {
@@ -228,7 +222,7 @@ test("an already-aborted command is never executed", async () => {
 test("an instance already named after the scope is adopted instead of duplicated", async () => {
   await fake.fetchImpl("https://api.agent37.com/v1/instances", {
     method: "POST",
-    body: JSON.stringify({ name: spriteScopeName("qmt", scope) }),
+    body: JSON.stringify({ name: sandboxScopeName("qmt", scope) }),
   });
   const h = await sandbox.provision(layers);
   assert.equal(h.coldStart, false);

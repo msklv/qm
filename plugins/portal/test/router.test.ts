@@ -68,6 +68,20 @@ const upstream = createServer((req: IncomingMessage, res) => {
       );
     });
   }
+  if (req.url?.startsWith("/api/files/")) {
+    res.writeHead(200, {
+      "content-type": "text/html; charset=utf-8",
+      "content-security-policy": "sandbox allow-scripts; frame-ancestors 'self' *.apps.test",
+    });
+    return void res.end("<p>hi</p>");
+  }
+  if (req.url?.startsWith("/app-edit")) {
+    res.writeHead(200, {
+      "content-type": "text/html; charset=utf-8",
+      "content-security-policy": "default-src 'self'; frame-ancestors 'self' demo.apps.test",
+    });
+    return void res.end("<p>edit</p>");
+  }
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify({ url: req.url, cookie: req.headers.cookie ?? null, headers: req.headers }));
 });
@@ -81,6 +95,8 @@ process.env.CORE_SIGNING_SECRET = "router-test-core-secret";
 process.env.WEB_UI_UPSTREAM = upstreamUrl;
 process.env.ADMIN_UPSTREAM = upstreamUrl;
 process.env.CORE_API_URL = upstreamUrl;
+const SESSION_TTL_S = 28800;
+process.env.PORTAL_SESSION_TTL_S = String(SESSION_TTL_S);
 
 const { server } = await import("../src/index.ts");
 const { deriveKey, seal, open } = await import("../src/session.ts");
@@ -91,7 +107,7 @@ const sessionKey = deriveKey("router-test-portal-secret", "portal.session.v1");
 function sessionCookie(sub: string, ageS = 0): string {
   const now = Math.floor(Date.now() / 1000);
   const iat = now - ageS;
-  return `portal_session=${encodeURIComponent(seal({ k: "session", sub, org: "acme", iat, exp: iat + 28800 }, sessionKey))}`;
+  return `portal_session=${encodeURIComponent(seal({ k: "session", sub, org: "acme", iat, exp: iat + SESSION_TTL_S }, sessionKey))}`;
 }
 
 test.after(() => {
@@ -116,6 +132,7 @@ test("favicon: served unauthenticated as an SVG of the pirate-flag emoji", async
 test("no session: JSON request is 401, HTML navigation is 302 to login", async () => {
   const j = await fetch(`${base}/api/sessions`, { redirect: "manual" });
   assert.equal(j.status, 401);
+  assert.equal(((await j.json()) as { loginUrl?: unknown }).loginUrl, "/auth/login");
   const h = await fetch(`${base}/`, { headers: { accept: "text/html" }, redirect: "manual" });
   assert.equal(h.status, 302);
   assert.match(h.headers.get("location") ?? "", /^\/auth\/login\?returnTo=/);
@@ -152,6 +169,15 @@ test("web-ui /app-edit drops x-frame-options so its own frame-ancestors CSP can 
   assert.equal(editPage.headers.get("x-frame-options"), null, "/app-edit must not carry the blanket DENY");
   const normal = await fetch(`${base}/api/x`, { headers: { cookie: sessionCookie("U1") } });
   assert.equal(normal.headers.get("x-frame-options"), "DENY", "every other surface path keeps DENY");
+});
+
+test("a surface that declares frame-ancestors keeps it; the blanket DENY stays on everything else", async () => {
+  const file = await fetch(`${base}/api/files/f1/content/demo.html`, { headers: { cookie: sessionCookie("U1") } });
+  assert.equal(file.status, 200);
+  assert.equal(file.headers.get("x-frame-options"), null, "DENY would defeat the surface's own frame-ancestors");
+  assert.match(file.headers.get("content-security-policy") ?? "", /frame-ancestors 'self' \*\.apps\.test/);
+  const normal = await fetch(`${base}/api/x`, { headers: { cookie: sessionCookie("U1") } });
+  assert.equal(normal.headers.get("x-frame-options"), "DENY");
 });
 
 test("admin tier (derived gate): non-admin sub is 403 before the upstream; admin sub gets admin=<sub>", async () => {
@@ -537,10 +563,13 @@ test("sliding renewal: a fresh session is NOT re-stamped, an aged one is re-issu
   const setCookie = aged.headers.get("set-cookie") ?? "";
   const m = setCookie.match(/portal_session=([^;]+)/);
   assert.ok(m, "an aged session is re-stamped through the proxy");
-  assert.match(setCookie, /Max-Age=28800/, "the renewed cookie carries a full TTL");
+  assert.match(setCookie, new RegExp(`Max-Age=${SESSION_TTL_S}\\b`), "the renewed cookie carries a full TTL");
   const claims = open(decodeURIComponent(m![1] ?? ""), sessionKey) as { sub: string; exp: number } | null;
   assert.equal(claims?.sub, "U1", "the renewed cookie is valid and preserves the sub");
-  assert.ok((claims?.exp ?? 0) > Math.floor(Date.now() / 1000) + 28000, "exp is pushed out to ~now + full TTL");
+  assert.ok(
+    (claims?.exp ?? 0) > Math.floor(Date.now() / 1000) + SESSION_TTL_S - 800,
+    "exp is pushed out to ~now + full TTL",
+  );
 });
 
 test("admin-status probe is memoized within the TTL (one round-trip per sub)", async () => {

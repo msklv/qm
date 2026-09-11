@@ -25,6 +25,8 @@ export interface AuthConfig {
   transport: EmailTransportKind;
   resendApiKey: string;
   smtp: SmtpSettings;
+  sessionIdleS: number;
+  sessionAbsoluteS: number;
   linkTtlS: number;
   codeTtlS: number;
   accessTtlS: number;
@@ -105,6 +107,8 @@ export function readConfig(env: NodeJS.ProcessEnv): AuthConfig {
       password: env.SMTP_PASSWORD ?? "",
       tls: smtpTlsFrom(env.SMTP_TLS, env.SMTP_PORT),
     },
+    sessionIdleS: numberFrom(env.AUTH_SESSION_IDLE_S, 30 * 86400),
+    sessionAbsoluteS: numberFrom(env.AUTH_SESSION_ABSOLUTE_S, 90 * 86400),
     linkTtlS: numberFrom(env.AUTH_LINK_TTL_S, 900),
     codeTtlS: numberFrom(env.AUTH_CODE_TTL_S, 120),
     accessTtlS: numberFrom(env.AUTH_ACCESS_TTL_S, 120),
@@ -162,7 +166,7 @@ export function bootProblems(cfg: AuthConfig, isProd: boolean): string[] {
     problems.push("AUTH_CLIENT_SECRET is required and may not be a placeholder");
   else if (cfg.clientSecret.trim().length < 32)
     problems.push(
-      "AUTH_CLIENT_SECRET must be at least 32 characters — it is the portal's only credential at the token endpoint",
+      "AUTH_CLIENT_SECRET must be at least 32 characters; it is the portal's only credential at the token endpoint",
     );
   if (isMissingOrPlaceholder(cfg.tokenSecret))
     problems.push("AUTH_TOKEN_SECRET is required and may not be a placeholder");
@@ -177,7 +181,7 @@ export function bootProblems(cfg: AuthConfig, isProd: boolean): string[] {
 
   if (!cfg.allowedEmails.length && !cfg.allowedEmailDomain) {
     problems.push(
-      "AUTH_ALLOWED_EMAILS or AUTH_ALLOWED_EMAIL_DOMAIN is required — without one, anybody with an inbox could sign in",
+      "AUTH_ALLOWED_EMAILS or AUTH_ALLOWED_EMAIL_DOMAIN is required; without one, anybody with an inbox could sign in",
     );
   }
   const badEmail = cfg.allowedEmails.find((email) => !validEmail(email) || isMissingOrPlaceholder(email));
@@ -215,7 +219,7 @@ export function bootProblems(cfg: AuthConfig, isProd: boolean): string[] {
 
   if (isProd && isMissingOrPlaceholder(cfg.coreSigningSecret)) {
     problems.push(
-      "CORE_SIGNING_SECRET is required — single-use enforcement for links and codes is durable state held by core",
+      "CORE_SIGNING_SECRET is required; single-use enforcement for links and codes is durable state held by core",
     );
   }
   if (cfg.linkTtlS > 3600) problems.push("AUTH_LINK_TTL_S must be at most 3600 seconds");
@@ -229,10 +233,19 @@ export function bootProblems(cfg: AuthConfig, isProd: boolean): string[] {
   ] as const) {
     if (!Number.isInteger(limit) || limit < 1 || limit > MAX_RATE_LIMIT_SLOTS) {
       problems.push(
-        `${name} must be a whole number between 1 and ${MAX_RATE_LIMIT_SLOTS} — each unit is one durable claim slot`,
+        `${name} must be a whole number between 1 and ${MAX_RATE_LIMIT_SLOTS}; each unit is one durable claim slot`,
       );
     }
   }
+  if (
+    !Number.isInteger(cfg.sessionIdleS) ||
+    !Number.isInteger(cfg.sessionAbsoluteS) ||
+    cfg.sessionIdleS > cfg.sessionAbsoluteS ||
+    cfg.sessionAbsoluteS > 90 * 86400
+  )
+    problems.push(
+      "AUTH_SESSION_IDLE_S and AUTH_SESSION_ABSOLUTE_S must be whole seconds with idle <= absolute <= 90 days",
+    );
   return problems;
 }
 
