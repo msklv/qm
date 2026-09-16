@@ -12,6 +12,21 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+function deferredRun() {
+  const completion = deferred<Response>();
+  let initial = true;
+  return {
+    resolve: completion.resolve,
+    response() {
+      if (initial) {
+        initial = false;
+        return Promise.resolve(Response.json({ status: "running", result: null }));
+      }
+      return completion.promise;
+    },
+  };
+}
+
 async function until(check: () => boolean): Promise<void> {
   for (let i = 0; i < 200; i++) {
     if (check()) return;
@@ -55,7 +70,7 @@ test("approval handoff unlocks queue and steer without losing pending decisions"
   let modelDeleted = false;
   let pending = [approval];
   let decision = deferred<Response>();
-  let continuation = deferred<Response>();
+  let continuation = deferredRun();
   const handoff = deferred<void>();
   let refreshGate: ReturnType<typeof deferred<void>> | undefined;
   let submitted = false;
@@ -86,7 +101,7 @@ test("approval handoff unlocks queue and steer without losing pending decisions"
       return decision.promise;
     }
     if (path.includes("/api/runs/active")) return Response.json({ runId: null, queued: [] });
-    if (path === "/api/runs/r1") return continuation.promise;
+    if (path === "/api/runs/r1") return continuation.response();
     if (path === "/api/runs/q1") return Response.json({ status: "done", result: { status: "ok", reply: "done" } });
     if (path === "/api/turn") return Response.json({ runId: "q1" });
     if (path === "/api/runs/q1/withdraw") return Response.json({ withdrawn: true });
@@ -110,7 +125,7 @@ test("approval handoff unlocks queue and steer without losing pending decisions"
     const { createConversation } = await vite.ssrLoadModule("/src/conversations.ts");
     const { entriesToMessages, attachPendingApprovals } = await vite.ssrLoadModule("/src/core-bridge.ts");
     const { transcriptModel } = await vite.ssrLoadModule("/src/model-options.ts");
-    const { seedRuntimeConfig } = await vite.ssrLoadModule("/src/composer.ts");
+    const { seedRuntimeConfig } = await vite.ssrLoadModule("/src/runtime-config-store.ts");
     seedRuntimeConfig(row.scopeId, await (await fetch("/api/runtime-config")).json());
     appState.me = { user: "owner", org: "test" };
     appState.currentView = "chats";
@@ -188,7 +203,7 @@ test("approval handoff unlocks queue and steer without losing pending decisions"
       click("Deny");
       await until(() => requests.some((r) => r.path === "/api/approvals/a2"));
       pending = [];
-      continuation = deferred<Response>();
+      continuation = deferredRun();
       continuation.resolve(Response.json({ status: "done", result: { status: "refused", reason: "approval denied" } }));
       decision.resolve(Response.json({ runId: "r1" }));
       await until(() => !chat.state.agent!.state.isStreaming && chat.state.resolvingApprovals.size === 0);
@@ -208,7 +223,7 @@ test("approval handoff unlocks queue and steer without losing pending decisions"
       submitted = false;
       pending = [approval];
       decision = deferred<Response>();
-      continuation = deferred<Response>();
+      continuation = deferredRun();
       mount();
       click("Allow once");
       decision.resolve(Response.json({ runId: "r1" }));
@@ -224,7 +239,7 @@ test("approval handoff unlocks queue and steer without losing pending decisions"
       submitted = false;
       pending = [approval];
       decision = deferred<Response>();
-      continuation = deferred<Response>();
+      continuation = deferredRun();
       mount();
       click("Allow once");
       decision.resolve(Response.json({ runId: "r1" }));
@@ -273,7 +288,7 @@ test("approval handoff unlocks queue and steer without losing pending decisions"
       selectedModelId = "deleted-overlay";
       modelDeleted = true;
       mount();
-      await chat.composer.refreshRuntimeSelection(row.scopeId, chat.state.agent!);
+      await chat.composer.refreshRuntimeSelection(row.scopeId, chat.state.agent!, true);
       await until(() => !!host.querySelector('select[aria-label="Replacement model"]'));
       assert.equal(chat.composer.currentModelOption(), undefined);
       assert.match(host.textContent ?? "", /deleted-overlay/);

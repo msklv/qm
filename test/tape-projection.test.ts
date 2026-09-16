@@ -22,7 +22,7 @@ interface Sim {
 }
 
 async function simSession(threadRef = "dm:projection-test"): Promise<Sim> {
-  const store = createMemorySessionStore({ now: () => CLOCK });
+  const store = { ...createMemorySessionStore({ now: () => CLOCK }), getTranscriptEntries: async () => [] };
   const session = await store.getOrCreateByThread(threadRef, "dm", scope);
   const { lease } = await store.acquireLease(session.id);
   assert.ok(lease);
@@ -36,6 +36,7 @@ interface SimCall {
   result: string;
   isError?: boolean;
   resultScope?: ScopeId;
+  resultPayload?: Record<string, unknown>;
 }
 
 interface SimStep {
@@ -128,7 +129,7 @@ async function simTurn(sim: Sim, turn: SimTurn): Promise<void> {
       await emit("tool_call", { ...c.args, tool: c.name, callId: c.id });
       await emit(
         "tool_result",
-        { tool: c.name, callId: c.id, isError: c.isError === true, result: c.result },
+        { ...c.resultPayload, tool: c.name, callId: c.id, isError: c.isError === true, result: c.result },
         c.resultScope ?? scope,
       );
       await tape({
@@ -334,6 +335,37 @@ test("overheard import and delivery note project to their entry shapes", async (
     entrySeq: imported.seq,
     meta: {
       overheard: true,
+      bareText: overheard.text,
+      ts: overheard.ts,
+      author: overheard.name,
+      entryCreatedAt: imported.createdAt,
+    },
+  });
+  await simTurn(sim, {
+    input: "yes, restart it",
+    reply: "Restarted.",
+    deliveryFiles: [{ name: "log.txt", mimetype: "text/plain", sizeBytes: 42, artifactId: "art_1" }],
+  });
+  await assertParity(sim);
+});
+
+test("agent-authored overheard import and delivery note project to their entry shapes", async () => {
+  const sim = await simSession();
+  const overheard: OverheardEntryPayload = {
+    overheard: true,
+    sourceRole: "agent",
+    ts: "1720000000.000050",
+    text: "Shall I restart the worker?",
+  };
+  const imported = await sim.store.append(sim.lease, { type: "user", payload: overheard, scopeLabel: scope });
+  await sim.store.appendTape(sim.lease, {
+    kind: "message",
+    payload: { role: "user", content: [{ type: "text", text: renderOverheard(overheard) }], timestamp: CLOCK },
+    scopeLabel: scope,
+    entrySeq: imported.seq,
+    meta: {
+      overheard: true,
+      sourceRole: "agent",
       bareText: overheard.text,
       ts: overheard.ts,
       author: overheard.name,
@@ -1072,4 +1104,76 @@ test("model-facing glue user rows (goal notes, env-only nudges) never render", a
   const userRows = projected!.filter((e) => e.type === "user");
   assert.equal(userRows.length, 1);
   assert.equal((userRows[0]!.payload as { text: string }).text, "work on it");
+});
+
+for (const failed of [false, true]) {
+  test(`attach transcript preserves structured results after completion (failed=${failed})`, async () => {
+    const sim = await simSession();
+    await sim.store.addParticipant(sim.session.id, "viewer@example.com", undefined, { includeHistory: true });
+    const files = [
+      { name: "desktop.png", mimetype: "image/png", sizeBytes: 123, artifactId: "desktop" },
+      { name: "phone.png", mimetype: "image/png", sizeBytes: 456, artifactId: "phone" },
+      { name: "preview.html", mimetype: "text/html", sizeBytes: 789, artifactId: "preview" },
+    ];
+    await simTurn(sim, {
+      input: "show the preview",
+      steps: [
+        {
+          calls: [
+            {
+              id: "attach-1",
+              name: "attach",
+              args: { files: files.map((f) => f.name) },
+              result: failed ? "[not attached] file not found" : "[attached] preview files",
+              isError: failed,
+              resultPayload: { ok: !failed, ...(failed ? {} : { files }) },
+            },
+          ],
+        },
+      ],
+      reply: failed ? "the file is missing" : "here is the preview",
+    });
+    const source = createTranscriptSource(sim.store);
+    const expected = await sim.store.getEntries(sim.session.id);
+    assert.deepEqual((await source.forRender(sim.session.id)).entries, expected);
+    assert.deepEqual((await source.forRender(sim.session.id, { limit: 3 })).entries, expected.slice(-3));
+    assert.deepEqual((await source.forRender(sim.session.id, { sinceSeq: 2 })).entries, expected.slice(2));
+    assert.deepEqual((await source.forViewer(sim.session.id, "viewer@example.com", { limit: 3 })).entries, expected);
+    assert.deepEqual((await source.forViewer(sim.session.id, "stranger@example.com")).entries, []);
+  });
+}
+
+test("attachment fallback preserves participant windows and repeated calls in an anchored tail", async () => {
+  const sim = await simSession();
+  await sim.store.addParticipant(sim.session.id, "early", undefined, { includeHistory: true });
+  for (let i = 0; i < 60; i++) await simTurn(sim, { input: `question ${i}`, reply: `answer ${i}` });
+  await sim.store.addParticipant(sim.session.id, "late");
+  await simTurn(sim, {
+    input: "attach twice",
+    steps: [
+      {
+        calls: ["old", "new"].map((artifactId) => ({
+          id: artifactId,
+          name: "attach",
+          args: { files: ["image.png"] },
+          result: "[attached] image.png",
+          resultPayload: { ok: true, files: [{ name: "image.png", mimetype: "image/png", sizeBytes: 12, artifactId }] },
+        })),
+      },
+    ],
+    reply: "latest image",
+  });
+  await sim.store.removeParticipant(sim.session.id, "early");
+  await simTurn(sim, { input: "private follow-up", reply: "later" });
+  const source = createTranscriptSource(sim.store);
+  assert.deepEqual(
+    (await source.forRender(sim.session.id, { limit: 8 })).entries,
+    await sim.store.getEntries(sim.session.id, { limit: 8 }),
+  );
+  for (const viewer of ["early", "late", "stranger"]) {
+    assert.deepEqual(
+      (await source.forViewer(sim.session.id, viewer, { limit: 8 })).entries,
+      await sim.store.visibleEntries(sim.session.id, viewer),
+    );
+  }
 });

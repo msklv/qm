@@ -158,12 +158,18 @@ export function stripTurnBoilerplate(text: string): string {
   return kept || text.trim();
 }
 
+export function visibleTitleEntryText(entry: SessionEntry): string | undefined {
+  const payload = entry.payload as { text?: unknown; display?: unknown } | null;
+  const value = entry.type === "user" && typeof payload?.display === "string" ? payload.display : payload?.text;
+  return typeof value === "string" ? value.trim() || undefined : undefined;
+}
+
 export function renderTitleTranscript(entries: SessionEntry[]): string {
   const lines: string[] = [];
   for (const e of entries) {
     if (e.type !== "user" && e.type !== "assistant") continue;
     if (isOverheardEntry(e)) continue;
-    const raw = (e.payload as { text?: string } | null)?.text?.trim();
+    const raw = visibleTitleEntryText(e);
     if (!raw) continue;
     const text = e.type === "user" ? stripTurnBoilerplate(raw) : raw;
     if (!text) continue;
@@ -226,6 +232,7 @@ export function replayableRequest(input: OrchestratorInput): TurnRequest {
   const c = input.conversation;
   return {
     surface: input.surface ?? "unknown",
+    ...(input.sessionSenderId ? { sessionSenderId: input.sessionSenderId } : {}),
     ...(input.scopeVersion ? { scopeVersion: input.scopeVersion } : {}),
     ...(input.deliveryTarget ? { deliveryTarget: input.deliveryTarget } : {}),
     ...(input.deliveryCandidates?.length ? { deliveryCandidates: input.deliveryCandidates } : {}),
@@ -254,6 +261,9 @@ export function replayableRequest(input: OrchestratorInput): TurnRequest {
     ...(input.thinkingLevel ? { thinkingLevel: input.thinkingLevel } : {}),
     ...(input.fastMode !== undefined ? { fastMode: input.fastMode } : {}),
     ...(input.readOnly ? { readOnly: true } : {}),
+    ...(input.privateSessionMessage
+      ? { privateSessionMessage: true as const, sessionMessageDepth: input.sessionMessageDepth }
+      : {}),
     ...(input.skipMemory ? { skipMemory: true } : {}),
     ...(input.surfaceTools ? { surfaceTools: true } : {}),
     ...(input.addressed ? { addressed: true } : {}),

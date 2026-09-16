@@ -287,6 +287,9 @@ test("shared-core platform guidance reaches both the DM and the spine prompt", a
     assert.match(prompt, /## Memory/);
     assert.match(prompt, /## Auth/);
     assert.match(prompt, /## Using skills/);
+    assert.match(prompt, /Compose task rules with one authorized access skill/);
+    assert.match(prompt, /prefer `skill:\/\/composio\/SKILL.md`/);
+    assert.match(prompt, /Never switch credentials to evade denial/);
     assert.doesNotMatch(prompt, /## Scheduling & self-configuration/);
   }
 });
@@ -421,3 +424,22 @@ test("Mode 2 (spine channel): static prose stays within the word-count ceiling (
       "This is expected to fail until the menu deletions in CONTRACT.md S5 land.",
   );
 });
+
+for (const surface of ["web", "slack"]) {
+  for (const mode of ["conversation", "autonomous", "fallback"]) {
+    test(`${surface} ${mode} turns share the Markdown chat contract`, async () => {
+      const prompt = await sysprompt(buildOrchestrator(), {
+        surface,
+        actor,
+        conversation: mode === "conversation" ? dmConversation : channelConversation,
+        surfaceTools: mode === "autonomous",
+        text: "",
+        origin: mode === "fallback" ? { kind: "automation" } : { kind: "direct" },
+      });
+      assert.match(prompt, /Chat uses Markdown/);
+      assert.match(prompt, /\[label\]\(url\)/);
+      assert.equal(countOccurrences(prompt, "Chat uses Markdown"), 1);
+      assertNoTemplateTokens(prompt, `${surface} ${mode}`);
+    });
+  }
+}
