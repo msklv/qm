@@ -3,7 +3,7 @@ name: Build CLI on provider tag
 on:
   push:
     tags:
-      - "v*-provider"
+      - "v*-provider*"
 
 permissions:
   contents: read
