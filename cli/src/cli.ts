@@ -28,6 +28,7 @@ import { cliVersion } from "./manifest.ts";
 import { gitTopLevel, promptHidden, writeEnvValue } from "./util.ts";
 import { scopeStorageKey } from "./scope-storage-key.ts";
 import { runAdminLogin } from "./commands/admin-login.ts";
+import { runProviderAdd, PROTOCOLS } from "./commands/provider-add.ts";
 import { syncDeploymentLayer } from "./deployment-layer.ts";
 
 interface Parsed {
@@ -37,7 +38,7 @@ interface Parsed {
 
 type Flags = Parsed["flags"];
 
-const BOOLEAN_FLAGS = new Set(["build-only", "ci", "dry-run", "f", "follow", "json", "live", "purge", "static", "yes"]);
+const BOOLEAN_FLAGS = new Set(["build-only", "ci", "dry-run", "f", "follow", "json", "live", "no-validate", "purge", "static", "yes"]);
 
 function parse(args: string[]): Parsed {
   const positionals: string[] = [];
@@ -140,6 +141,11 @@ ${bold("DEPLOY (operator)")} ${dim("— runs in the deployment directory")}
   slack render                             render the bot manifest (+ SSO manifest for Slack OIDC)
   outputs [--json]                         print the Web UI, health, and Slack app creation links
   admin-login [--email <admin-email>]      print a single-use admin login link, valid for five minutes
+  provider add <id> --protocol ${PROTOCOLS.join("|")} --base-url <url>
+       --models <m1,m2> [--name <name>] [--api-key <key>] [--admin <email>] [--no-validate]
+                                           register a custom OpenAI-compatible or Anthropic model
+                                           provider with the running core's admin API (live; the key is
+                                           prompted if omitted)
   proof scope-key <scope-id>               derive the provider snapshot key for an exact scope
   infra render                             re-derive infra/terraform.tfvars from config
   infra build-image                        build the AWS deploy MicroVM image and record its pin
@@ -439,6 +445,43 @@ async function dispatch(argv: string[]): Promise<void> {
         configPath: strFlag(flags, "config"),
         envFile: strFlag(flags, "env-file"),
         email: strFlag(flags, "email"),
+      });
+      return;
+    }
+
+    case "provider": {
+      if (positionals[0] !== "add") {
+        throw new CliError(
+          `usage: ${CLI_NAME} provider add <id> --name <name> --protocol ${PROTOCOLS.join("|")} ` +
+            `--base-url <url> --models m1,m2 [--api-key <key>] [--admin <email>] [--no-validate]`,
+        );
+      }
+      rejectExtraPositionals(positionals, 2);
+      rejectUnknownFlags(flags, ["config", "env-file", "name", "protocol", "base-url", "models", "api-key", "admin", "no-validate"]);
+      const id = positionals[1];
+      const protocol = strFlag(flags, "protocol");
+      const baseUrl = strFlag(flags, "base-url");
+      const models = (strFlag(flags, "models") ?? "").split(",").map((model) => model.trim()).filter(Boolean);
+      let apiKey = strFlag(flags, "api-key");
+      if (!protocol || !baseUrl || !id) {
+        throw new CliError(
+          `usage: ${CLI_NAME} provider add <id> --name <name> --protocol ${PROTOCOLS.join("|")} ` +
+            `--base-url <url> --models m1,m2 [--api-key <key>]`,
+          { clause: "cli.invocation" },
+        );
+      }
+      if (apiKey === undefined && process.stdin.isTTY) apiKey = await promptHidden("API key");
+      await runProviderAdd({
+        id,
+        protocol,
+        baseUrl,
+        models,
+        ...(strFlag(flags, "name") ? { name: strFlag(flags, "name") } : {}),
+        ...(apiKey !== undefined ? { apiKey } : {}),
+        ...(strFlag(flags, "admin") ? { admin: strFlag(flags, "admin") } : {}),
+        validate: !boolFlag(flags, "no-validate"),
+        configPath: strFlag(flags, "config"),
+        envFile: strFlag(flags, "env-file"),
       });
       return;
     }

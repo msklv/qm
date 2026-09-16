@@ -51,6 +51,7 @@ test("help lists every deploy + develop command and the deploy-wide options", as
       "check",
       "config get",
       "admin-login",
+      "provider add",
       "status",
       "logs",
       "down",
@@ -88,6 +89,68 @@ test("layer sync exposes deployment-layer reconciliation", async () => {
     assert.equal(result.exitCode, null, result.out);
     assert.match(result.out, /deployment layer: skipped/);
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("provider add registers a custom provider against the live core admin API", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-dispatch-provider-"));
+  writeFileSync(
+    join(dir, CONFIG_FILENAME),
+    JSON.stringify({
+      contract: 1,
+      orgId: "acme",
+      publicUrl: "http://localhost:8080",
+      target: "docker",
+      services: ["core"],
+      sandbox: { app: "acme-sandboxes" },
+    }),
+  );
+  writeFileSync(join(dir, ".env"), "CORE_SIGNING_SECRET=1234567890abcdef1234567890abcdef\nADMIN_GRANTS=admin@acme.test:org_admin\n");
+  const grabbed: { url: string; init: RequestInit | undefined }[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (
+    input: Parameters<typeof fetch>[0],
+    init?: RequestInit,
+  ): Promise<Response> => {
+    grabbed.push({ url: String(input), init });
+    return new Response(JSON.stringify({ ok: true, id: "gnivc", name: "GNIVC", protocol: "openai" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  try {
+    const result = await run(
+      [
+        "provider",
+        "add",
+        "gnivc",
+        "--name",
+        "GNIVC",
+        "--protocol",
+        "openai",
+        "--base-url",
+        "https://api.ai.gnivc.ru/v1/",
+        "--models",
+        "deepseek-v4-flash",
+        "--admin",
+        "admin@acme.test",
+      ],
+      dir,
+    );
+    assert.equal(result.exitCode, null, result.out);
+    assert.match(result.out, /gnivc registered/);
+    assert.equal(grabbed.length, 1);
+    const call = grabbed[0]!;
+    assert.ok(call.url.includes("/v1/admin/custom-providers/gnivc"), call.url);
+    assert.ok(call.url.includes("_sourceAuthNonce="), call.url);
+    const headers = call.init?.headers as Record<string, string>;
+    assert.equal(headers["x-admin-actor"], "admin@acme.test@acme");
+    assert.ok(headers["x-signature"], "expected a source-auth signature header");
+    assert.ok(headers["x-timestamp"], "expected a source-auth timestamp header");
+    assert.match(call.url, /^http:\/\/localhost:8080\/v1\/admin\/custom-providers\/gnivc\?_sourceAuthNonce=/);
+  } finally {
+    globalThis.fetch = realFetch;
     rmSync(dir, { recursive: true, force: true });
   }
 });
