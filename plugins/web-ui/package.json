@@ -44,6 +44,9 @@
     },
     "@mariozechner/mini-lit": {
       "marked": "^18.0.5"
-    }
+    },
+    "undici": "^7.29.1",
+    "nanoid": "3.3.19",
+    "postcss": "8.5.23"
   }
 }
