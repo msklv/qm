@@ -1,0 +1,35 @@
+name: Build CLI on provider tag
+
+on:
+  push:
+    tags:
+      - "v*-provider"
+
+permissions:
+  contents: read
+
+jobs:
+  build-cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: cli/package-lock.json
+      - name: Install CLI dependencies
+        working-directory: cli
+        run: npm ci
+      - name: Build CLI
+        working-directory: cli
+        run: npm run build
+      - name: Smoke-test the built binary
+        working-directory: cli
+        run: node dist/bin/qm.js help
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: qm-cli-${{ github.ref_name }}
+          path: cli/dist
+          if-no-files-found: error
