@@ -59,8 +59,23 @@ export async function getModelProviders(ctx: ApiCtx): Promise<void> {
     resource: "model-providers",
     scopeLabel: orgScope(ctx.deps),
   });
+  // Aggregate status for built-in providers plus any custom (GNIVC-style)
+  // providers so the admin UI lists them and does not claim their key is
+  // missing when one is configured.
+  type ProviderStatus = { provider: string; configured: boolean; source: "admin" | "environment" | "absent" };
+  const providers: ProviderStatus[] = await ctx.deps.modelCredentials.statuses();
+  if (ctx.deps.customProviders) {
+    for (const status of await ctx.deps.customProviders.statuses()) {
+      if (status.disabled) continue;
+      providers.push({
+        provider: status.id,
+        configured: status.hasKey,
+        source: status.hasKey ? "admin" : "absent",
+      });
+    }
+  }
   return sendJson(ctx.res, 200, {
-    providers: await ctx.deps.modelCredentials.statuses(),
+    providers,
     models: await selectableModelCatalog(ctx.deps.modelCredentialFetch),
     ...(ctx.deps.harnessCarriedModelAuth
       ? { harnessAuth: { harnessId: ctx.deps.harnessId ?? "pi", provider: ctx.deps.harnessCarriedModelAuth } }
