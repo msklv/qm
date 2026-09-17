@@ -1068,6 +1068,12 @@ async function getSurfaceConfig(ctx: ApiCtx): Promise<void> {
   const managedKeys = deps.modelCredentials ? await deps.modelCredentials.availability() : null;
   const configuredKeys = deps.providerKeys ?? managedKeys;
   const providerStatus = harnessId === "pi" && managedKeys ? managedKeys : configuredKeys;
+  // A configured custom provider (GNIVC-style) satisfies the provider gate even
+  // though it lives outside the built-in modelCredentials store — otherwise
+  // modelProviderConfigured stays false and the portal 302-loops admins to
+  // /admin/onboarding (plugins/portal/src/index.ts web-ui HTML gate).
+  const customStatuses = deps.customProviders ? await deps.customProviders.statuses() : [];
+  const customKeyConfigured = customStatuses.some((s) => !s.disabled && s.hasKey);
   const catalog = managedKeys?.openrouter
     ? await selectableModelCatalog(deps.modelCredentialFetch)
     : builtInModelCatalog();
@@ -1094,6 +1100,7 @@ async function getSurfaceConfig(ctx: ApiCtx): Promise<void> {
         providerStatus.openai ||
         providerStatus.openrouter ||
         providerStatus.modelIds?.size ||
+        customKeyConfigured ||
         deps.harnessCarriedModelAuth,
       ),
     }),
