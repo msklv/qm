@@ -1,3 +1,4 @@
+import { captureMessage } from "./product-analytics.ts";
 import { streamedAnswer } from "./timeline.ts";
 import { EventType } from "@tanstack/ai/client";
 import { fetchServerSentEvents, StreamProcessor } from "@tanstack/ai-client";
@@ -1173,6 +1174,14 @@ async function drive(
     });
 
     if (submit.runId) {
+      if (!opener) {
+        const userMessages = agent.state.messages.filter(
+          (message) =>
+            (message.role === "user" || message.role === "user-with-attachments") &&
+            !(message as { opener?: boolean }).opener,
+        );
+        captureMessage(submit.runId, userMessages.length === 1);
+      }
       const message = agent.state.messages.find((message) => idempotencyKey && sendKeyOf(message) === idempotencyKey);
       if (message) (message as unknown as HistoryUserMessage).runId = submit.runId;
       await followRun(stream, partial, submit.runId, signal, notify, undefined, slot, gen);
@@ -1883,7 +1892,7 @@ export function entriesToMessages(entries: SessionEntry[], model?: Model<Api>): 
       stopReason: stopped ? "aborted" : "stop",
       timestamp: at ?? pending[pending.length - 1]?.createdAt,
     };
-    if (pending.length) {
+    if (pending.length || (stopped && timing?.startedAt !== undefined)) {
       const boundary = pending.findLast(
         (entry) => typeof (entry.payload as { workStartedAt?: unknown } | null)?.workStartedAt === "number",
       )?.payload as { workStartedAt: number } | undefined;
@@ -2005,7 +2014,8 @@ export function entriesToMessages(entries: SessionEntry[], model?: Model<Api>): 
         ...(typeof payload?.workStartedAt === "number" ? { startedAt: payload.workStartedAt } : {}),
         ...(typeof payload?.workFinishedAt === "number" ? { finishedAt: payload.workFinishedAt } : {}),
       };
-      if (text || pending.length || heldPosts.size || payload?.stopped) {
+      const stopped = payload?.stopped === true || text.trim() === "(stopped)";
+      if (text || pending.length || heldPosts.size || stopped) {
         spillHeldPosts();
         if (posted && text) {
           pending.push({
@@ -2015,9 +2025,9 @@ export function entriesToMessages(entries: SessionEntry[], model?: Model<Api>): 
             payload: { text, demoted: true },
             createdAt: e.createdAt,
           });
-          flushWork("", e.createdAt, false, timing, payload?.stopped === true);
+          flushWork("", e.createdAt, false, timing, stopped);
         } else {
-          flushWork(text, e.createdAt, !posted, timing, payload?.stopped === true);
+          flushWork(text, e.createdAt, !posted, timing, stopped);
         }
       }
       posted = false;

@@ -105,7 +105,7 @@ import { createMemoryMap } from "../persistence/durable-map.ts";
 import { collectBlob, createMemoryBlobTransferStore } from "../persistence/blob-transfer.ts";
 import { createSkillMaterializer, skillsIndex, SKILLS_DIR } from "../skills/materialize.ts";
 import {
-  detectOnboardingStatus,
+  resolveOnboardingStatus,
   onboardingSkillVisible,
   isIdeasConversation,
   PROACTIVE_OPENER_PROMPT,
@@ -158,7 +158,7 @@ import {
 import { errMessage, swallow, swallowAs } from "../util/errors.ts";
 import { isObj } from "../util/objects.ts";
 import { absoluteAppLinks, headSlice, jsonbSafeStringify } from "../util/text.ts";
-import { NonRetryableTurnError, turnFailureMessage, type TurnFailurePayload } from "./turn-error.ts";
+import { NonRetryableTurnError, TitleRejected, turnFailureMessage, type TurnFailurePayload } from "./turn-error.ts";
 import { personKey, samePerson } from "../directory/person.ts";
 import { sleep } from "../util/async.ts";
 import { hashId } from "../util/crypto.ts";
@@ -312,12 +312,15 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       ]);
       return summary?.trim() || undefined;
     } catch (e) {
-      deps.errors?.record({
-        category: "command_policy",
-        code: "summary_failed",
-        message: errMessage(e),
-        scopeLabel: scopeId,
-      });
+      deps.errors?.record(
+        {
+          category: "command_policy",
+          code: "summary_failed",
+          message: errMessage(e),
+          scopeLabel: scopeId,
+        },
+        e,
+      );
       return undefined;
     }
   }
@@ -342,13 +345,16 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
     try {
       title = await deps.harness.models.generateTitle?.(transcript);
     } catch (e) {
-      deps.errors?.record({
-        category: "session_title",
-        code: "generation_failed",
-        message: errMessage(e),
-        scopeLabel: scopeId,
-        sessionId,
-      });
+      deps.errors?.record(
+        {
+          category: "session_title",
+          code: e instanceof TitleRejected ? `rejected_${e.rule}` : "generation_failed",
+          message: errMessage(e),
+          scopeLabel: scopeId,
+          sessionId,
+        },
+        e,
+      );
     }
     title ??= fallbackText ? fallbackSessionTitle(fallbackText) : undefined;
     if (title) {
@@ -523,7 +529,11 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
     },
 
     async handleTurn(input: OrchestratorInput): Promise<TurnResult> {
-      if (input.swarm && !deps.swarms) throw new Error("swarm service unavailable");
+      if (
+        !deps.swarms &&
+        (input.swarm || input.surface === "swarm" || input.conversation.threadRef.startsWith("swarm:"))
+      )
+        throw new NonRetryableTurnError("swarm service unavailable");
       const swarmBinding = await deps.swarms?.binding(input);
       const swarmEntryProvenance = input.swarm ? { origin: "automation", swarm: input.swarm } : {};
       await deps.refreshModels?.();
@@ -1218,8 +1228,9 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         ? "## Ideas conversation\nThe user chose to explore ideas in this conversation. Skip the onboarding skill and setup flow for this entire conversation, including follow-ups. Do not mark onboarding completed or dismissed in memory. Use available authorized company context and answer their request directly."
         : "";
       if (!onboardingBlock && useMemory && conversation.kind === "dm" && onboardingSkillVisible(visibleSkills)) {
-        const fullMemory = await deps.memory.read(memoryScopeId).catch(swallowAs("orchestrator: memory read", ""));
-        onboardingBlock = renderPendingOnboardingPrompt(detectOnboardingStatus(fullMemory));
+        onboardingBlock = await resolveOnboardingStatus(deps.memory, deps.sessions, memoryScopeId)
+          .then(renderPendingOnboardingPrompt)
+          .catch(swallowAs("orchestrator: onboarding status", ""));
       }
 
       let type: SessionType = "channel";
@@ -2208,13 +2219,16 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               }
             : {}),
           onError: (e) =>
-            deps.errors?.record({
-              category: "file_store",
-              code: "register_failed",
-              message: errMessage(e),
-              scopeLabel: scopeId,
-              sessionId: session.id,
-            }),
+            deps.errors?.record(
+              {
+                category: "file_store",
+                code: "register_failed",
+                message: errMessage(e),
+                scopeLabel: scopeId,
+                sessionId: session.id,
+              },
+              e,
+            ),
         };
         const postProvenance = (deliveryKey: string): DeliveryProvenance =>
           turnDeliveryProvenance({
@@ -3557,13 +3571,16 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                 idempotencyKey: input.runId ?? `${session.id}:${spine.turnUserEntrySeq ?? "turn"}`,
               });
             } catch (e) {
-              deps.errors?.record({
-                category: "memory",
-                code: "capture_failed",
-                message: errMessage(e),
-                scopeLabel: scopeId,
-                sessionId: session.id,
-              });
+              deps.errors?.record(
+                {
+                  category: "memory",
+                  code: "capture_failed",
+                  message: errMessage(e),
+                  scopeLabel: scopeId,
+                  sessionId: session.id,
+                },
+                e,
+              );
             } finally {
               deps.metrics?.record({
                 totalMs: 0,
@@ -3605,13 +3622,16 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                       }),
                   });
                 } catch (e) {
-                  deps.errors?.record({
-                    category: "keychain",
-                    code: "device_flow_capture_failed",
-                    message: errMessage(e),
-                    scopeLabel: scopeId,
-                    sessionId: session.id,
-                  });
+                  deps.errors?.record(
+                    {
+                      category: "keychain",
+                      code: "device_flow_capture_failed",
+                      message: errMessage(e),
+                      scopeLabel: scopeId,
+                      sessionId: session.id,
+                    },
+                    e,
+                  );
                 }
               }
             }
@@ -3795,13 +3815,16 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           });
           return { status: "refused", sessionId: session.id, reason: err.message };
         }
-        deps.errors?.record({
-          category: "turn",
-          code: "error",
-          message: errMessage(err),
-          scopeLabel: scopeId,
-          sessionId: session.id,
-        });
+        deps.errors?.record(
+          {
+            category: "turn",
+            code: "error",
+            message: errMessage(err),
+            scopeLabel: scopeId,
+            sessionId: session.id,
+          },
+          err,
+        );
         markErrorRecorded(err);
         if ((err instanceof NonRetryableTurnError || input.finalAttempt) && !input.cancel?.aborted) {
           const mirrorFailureEntry = async (entry: SessionEntry | undefined): Promise<void> => {

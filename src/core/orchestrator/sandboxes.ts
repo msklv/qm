@@ -257,13 +257,16 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
           await deps.deviceFlowCutover?.markResidentReset(memoryScopeId, service, generation, handle.resourceId);
         }
       } catch (err) {
-        deps.errors?.record({
-          category: "keychain",
-          code: "device_flow_restore_failed",
-          message: errMessage(err),
-          scopeLabel: scopeId,
-          sessionId: session.id,
-        });
+        deps.errors?.record(
+          {
+            category: "keychain",
+            code: "device_flow_restore_failed",
+            message: errMessage(err),
+            scopeLabel: scopeId,
+            sessionId: session.id,
+          },
+          err,
+        );
       }
       emit("creds", deviceFlowStart, Date.now());
       perf.credsMs += Date.now() - deviceFlowStart;
@@ -291,26 +294,21 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
       try {
         await reconcileProcesses(deps.sandbox, handle, deps.processes, memoryScopeId);
       } catch (err) {
-        deps.errors?.record({
-          category: "process_session",
-          code: "reconcile_failed",
-          message: errMessage(err),
-          scopeLabel: scopeId,
-          sessionId: session.id,
-        });
+        deps.errors?.record(
+          {
+            category: "process_session",
+            code: "reconcile_failed",
+            message: errMessage(err),
+            scopeLabel: scopeId,
+            sessionId: session.id,
+          },
+          err,
+        );
       } finally {
         emit("proc_reconcile", procReconcileStart, Date.now());
       }
     }
-    if (deps.skills) {
-      const materializeStart = Date.now();
-      try {
-        await skillMaterializer.materializeIndex(deps.sandbox, handle, visibleSkills, visibleSkillsForTurn);
-      } finally {
-        emit("skills_materialize", materializeStart, Date.now());
-        box.materializeMs = Date.now() - materializeStart;
-      }
-    }
+    if (deps.skills) await skillMaterializer.reconcileIndex(deps.sandbox, handle, visibleSkills, visibleSkillsForTurn);
     box.handle = handle;
     return handle;
   };
@@ -356,13 +354,16 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
       if (r.skill && deps.skills)
         void deps.skills.recordUse(r.skill.id).catch((e) => swallow("orchestrator: skill recordUse", e));
     } catch (err) {
-      deps.errors?.record({
-        category: "skills",
-        code: "tree_materialize_failed",
-        message: errMessage(err),
-        scopeLabel: scopeId,
-        sessionId: session.id,
-      });
+      deps.errors?.record(
+        {
+          category: "skills",
+          code: "tree_materialize_failed",
+          message: errMessage(err),
+          scopeLabel: scopeId,
+          sessionId: session.id,
+        },
+        err,
+      );
     } finally {
       emitGapWork("skills_materialize", start, Date.now());
     }
@@ -370,9 +371,12 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
   const ensureSkillTree = async (skillDir: string, sandboxId?: string): Promise<void> => {
     const current = await visibleSkillsForTurn();
     const requested = current.filter(
-      (r) => r.skill && (skillDir === ".packs" ? r.skill.pack : r.skill.manifest.name === skillDir),
+      (r) =>
+        r.skill &&
+        (skillDir.startsWith(".packs/")
+          ? r.skill.pack?.packId === skillDir.slice(".packs/".length)
+          : r.skill.manifest.name === skillDir),
     );
-    if (!requested.length) return;
     const handle = sandboxId ? await provisionResource(sandboxId) : await provision();
     for (const r of requested) {
       await materializeSkillTree(handle, r, sandboxId);
@@ -398,7 +402,7 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
       await prepareCredentials(handle, emitGapWork);
       await prepareTurnFiles(handle);
       if (deps.skills)
-        await skillMaterializer.materializeIndex(deps.sandbox, handle, visibleSkills, visibleSkillsForTurn);
+        await skillMaterializer.reconcileIndex(deps.sandbox, handle, visibleSkills, visibleSkillsForTurn);
       resourceHandles.set(id, handle);
       resourcePendingHandles.delete(id);
       return handle;
@@ -488,24 +492,30 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
           if (pendingHandle) {
             try {
               await scrubOwnerAuthHandle(pendingHandle).catch((scrubErr) => {
-                deps.errors?.record({
-                  category: "sandbox",
-                  code: "owner_auth_scrub_failed",
-                  message: errMessage(scrubErr),
-                  scopeLabel: scopeId,
-                  sessionId: session.id,
-                });
+                deps.errors?.record(
+                  {
+                    category: "sandbox",
+                    code: "owner_auth_scrub_failed",
+                    message: errMessage(scrubErr),
+                    scopeLabel: scopeId,
+                    sessionId: session.id,
+                  },
+                  scrubErr,
+                );
               });
               await destroyOwnerAuthHandle(pendingHandle);
               if (ownerAuthBox.pending === pendingHandle) ownerAuthBox.pending = null;
             } catch (cleanupErr) {
-              deps.errors?.record({
-                category: "sandbox",
-                code: "owner_auth_init_cleanup_failed",
-                message: errMessage(cleanupErr),
-                scopeLabel: scopeId,
-                sessionId: session.id,
-              });
+              deps.errors?.record(
+                {
+                  category: "sandbox",
+                  code: "owner_auth_init_cleanup_failed",
+                  message: errMessage(cleanupErr),
+                  scopeLabel: scopeId,
+                  sessionId: session.id,
+                },
+                cleanupErr,
+              );
             }
           }
           throw err;
@@ -592,26 +602,32 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
     if (ownerHandle) {
       try {
         await scrubOwnerAuthHandle(ownerHandle).catch((scrubErr) => {
-          deps.errors?.record({
-            category: "sandbox",
-            code: "owner_auth_scrub_failed",
-            message: errMessage(scrubErr),
-            scopeLabel: scopeId,
-            sessionId: session.id,
-          });
+          deps.errors?.record(
+            {
+              category: "sandbox",
+              code: "owner_auth_scrub_failed",
+              message: errMessage(scrubErr),
+              scopeLabel: scopeId,
+              sessionId: session.id,
+            },
+            scrubErr,
+          );
         });
         await destroyOwnerAuthHandle(ownerHandle);
         ownerAuthBox.handle = null;
         ownerAuthBox.pending = null;
       } catch (err) {
         ownerCleanupError = err;
-        deps.errors?.record({
-          category: "sandbox",
-          code: "owner_auth_destroy_failed",
-          message: errMessage(err),
-          scopeLabel: scopeId,
-          sessionId: session.id,
-        });
+        deps.errors?.record(
+          {
+            category: "sandbox",
+            code: "owner_auth_destroy_failed",
+            message: errMessage(err),
+            scopeLabel: scopeId,
+            sessionId: session.id,
+          },
+          err,
+        );
       }
     }
     const scratchHandle = scratchBox.handle;

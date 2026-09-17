@@ -1,3 +1,5 @@
+import "./instrument.ts";
+import { flushErrorReporting, reportBackendError } from "../../chassis/src/error-reporting.ts";
 import { appEditSlug } from "../src/app-edit.ts";
 import { composioCallbackUrl } from "./composio-return.ts";
 import { sharedSessionHtml } from "./shared-session.ts";
@@ -172,13 +174,30 @@ const CONTENT_TYPES: Record<string, string> = {
   ".wasm": "application/wasm",
 };
 
+const analyticsKey = process.env.POSTHOG_API_KEY?.trim();
+if (analyticsKey && !/^phc_[A-Za-z0-9]+$/.test(analyticsKey))
+  throw new Error("POSTHOG_API_KEY must be a public project ingestion token");
+const analyticsHost = new URL((analyticsKey && process.env.POSTHOG_HOST?.trim()) || "https://us.i.posthog.com");
+if (
+  analyticsKey &&
+  (analyticsHost.protocol !== "https:" ||
+    analyticsHost.username ||
+    analyticsHost.password ||
+    analyticsHost.search ||
+    analyticsHost.hash ||
+    analyticsHost.pathname !== "/")
+) {
+  throw new Error("POSTHOG_HOST must be an HTTPS origin");
+}
+const analyticsConfig = analyticsKey ? { apiKey: analyticsKey, host: analyticsHost.origin } : undefined;
+
 const SPA_CSP = [
   "default-src 'self'",
   "script-src 'self' 'wasm-unsafe-eval'",
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob: https:",
   "font-src 'self' data:",
-  "connect-src 'self'",
+  `connect-src 'self'${analyticsConfig ? ` ${analyticsConfig.host}` : ""}`,
   "frame-src 'self' data: https:",
   "worker-src 'self' blob:",
   "frame-ancestors 'self'",
@@ -1224,6 +1243,7 @@ const apiRoutes: readonly WebRoute[] = [
         user,
         org: ORG,
         companyName: companyBranding.orgName?.trim() || null,
+        ...(analyticsConfig && !resolveIdentity(req)?.impersonator ? { analytics: analyticsConfig } : {}),
         mode: AUTH_MODE,
         slackWorkspaceUrl: workspaceUrl,
         individualModelAuth: parsed.individualModelAuth === true,
@@ -1494,6 +1514,15 @@ const apiRoutes: readonly WebRoute[] = [
     handle: async (c) => {
       const { res, user } = c;
       return relayCore(res, "GET", `/v1/loops/inbox?principalId=${encodeURIComponent(user)}`);
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/inbox/sent-chat",
+    handle: async ({ req, res, user }) => {
+      if (!isInboxUser(user)) return json(res, 403, { error: "forbidden" });
+      res.setHeader("Cache-Control", "no-store");
+      return relayCore(res, "POST", "/v1/loops/inbox/sent-chat", await readBody(req));
     },
   },
   {
@@ -2482,6 +2511,29 @@ const apiRoutes: readonly WebRoute[] = [
   },
   {
     method: "GET",
+    path: "/api/inbox/sent/:messageId",
+    handle: async ({ res, user, params }) => {
+      if (!isInboxUser(user)) return json(res, 403, { error: "forbidden" });
+      res.setHeader("Cache-Control", "no-store");
+      return relayCore(res, "GET", `/v1/connectors/gmail/sent/${encodeURIComponent(params.messageId!)}`);
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/inbox/sent",
+    handle: async ({ res, user, url }) => {
+      if (!isInboxUser(user)) return json(res, 403, { error: "forbidden" });
+      const params = new URLSearchParams();
+      for (const key of ["pageToken", "accountType"]) {
+        const value = url.searchParams.get(key);
+        if (value) params.set(key, value);
+      }
+      res.setHeader("Cache-Control", "no-store");
+      return relayCore(res, "GET", `/v1/connectors/gmail/sent?${params}`);
+    },
+  },
+  {
+    method: "GET",
     path: "/api/loops",
     handle: async (c) => {
       const { res, user } = c;
@@ -3035,6 +3087,7 @@ export const handler = async (req: IncomingMessage, res: ServerResponse) => {
 
 const server = createServer((req, res) => {
   void handler(req, res).catch((err: unknown) => {
+    reportBackendError(err);
     console.error("%s", `[web-ui] 502 ${req.method ?? "?"} ${req.url ?? "?"}:`, String(err));
     if (!res.headersSent) json(res, 502, { error: "bad_gateway", message: "upstream error" });
     else res.end();
@@ -3059,8 +3112,10 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
         void runInboxFeed();
       });
     })
-    .catch((err: unknown) => {
+    .catch(async (err: unknown) => {
+      reportBackendError(err);
       console.error("[web-ui] failed to start:", String(err));
+      await flushErrorReporting();
       process.exit(1);
     });
 }
