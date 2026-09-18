@@ -43,7 +43,7 @@ import type { SessionShare, SessionShareStore } from "./sessions/session-share.t
 import { createModelOverlayStore, type ModelOverlayStore } from "./model/model-overlay-store.ts";
 import { mkdirSync } from "node:fs";
 import type { StagedEnvelope } from "./slack/envelope-staging.ts";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import {
   baseModelProviders,
@@ -201,6 +201,13 @@ import { createLocalSandbox } from "./sandbox/local-sandbox.ts";
 import { createSpritesSandbox } from "./sandbox/sprites-sandbox.ts";
 import { createSmolmachinesSandbox } from "./sandbox/smolmachines-sandbox.ts";
 import { createAgent37Sandbox } from "./sandbox/agent37-sandbox.ts";
+import {
+  createConfigEpochResolver,
+  createSuperserveSandbox,
+  type StoredConfigEpoch,
+  type StoredSuperserveSandbox,
+} from "./sandbox/superserve-sandbox.ts";
+import { createSdkSuperserveClient } from "./sandbox/superserve-client.ts";
 import { createE2bSandbox, type StoredE2bSandbox } from "./sandbox/e2b-sandbox.ts";
 import { createSdkE2bClient } from "./sandbox/e2b-client.ts";
 import { createS3SnapshotStore } from "./sandbox/home-snapshot.ts";
@@ -875,6 +882,7 @@ export function buildApp(
     if (!modal.tokenId || !modal.tokenSecret)
       throw new Error("SANDBOX_BACKEND=modal requires MODAL_TOKEN_ID and MODAL_TOKEN_SECRET");
     return createModalSandbox(workspace, {
+      advisoryLock,
       client: createSdkModalClient({
         tokenId: modal.tokenId,
         tokenSecret: modal.tokenSecret,
@@ -924,6 +932,60 @@ export function buildApp(
       ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
       onError: sandboxOnError,
     });
+  const superserveBodies = artifactMap<StoredSuperserveSandbox>("superserve_sandbox_bodies");
+  const superserveEpochs = artifactMap<StoredConfigEpoch>("superserve_config_epochs");
+  const buildSuperserve = (): Sandbox => {
+    const ss = config.superserveSandbox;
+    if (!ss.apiKey) throw new Error("SANDBOX_BACKEND=superserve requires SUPERSERVE_API_KEY");
+    if (!ss.template)
+      throw new Error("SANDBOX_BACKEND=superserve requires SUPERSERVE_TEMPLATE (a ready qm-agent-<release> template)");
+    const keepWarmSec = Math.ceil(config.backgroundJobTtlMaxMs / 1000);
+    const generationKey = createHash("sha256")
+      .update(
+        JSON.stringify([
+          config.buildSha ?? "",
+          ss.template,
+          ss.namePrefix ?? "",
+          ss.homeDir ?? "",
+          ss.idlePauseSec ?? null,
+          ss.retentionSec ?? null,
+          keepWarmSec,
+          [...(ss.egressAllow ?? [])].sort(),
+          [...(ss.egressDeny ?? [])].sort(),
+        ]),
+      )
+      .digest("hex")
+      .slice(0, 32);
+    return createSuperserveSandbox(workspace, {
+      configEpoch:
+        ss.configGeneration ??
+        (pgArtifactMap ? createConfigEpochResolver(superserveEpochs, generationKey, advisoryLock) : 0),
+      client: createSdkSuperserveClient({
+        apiKey: ss.apiKey,
+        ...(ss.baseUrl ? { baseUrl: ss.baseUrl } : {}),
+        ...(ss.template ? { template: ss.template } : {}),
+      }),
+      ...(ss.namePrefix ? { namePrefix: ss.namePrefix } : {}),
+      template: ss.template,
+      ...(ss.homeDir ? { homeDir: ss.homeDir } : {}),
+      ...(ss.idlePauseSec !== undefined ? { idlePauseSec: ss.idlePauseSec } : {}),
+      keepWarmSec,
+      ...(ss.retentionSec !== undefined ? { retentionSec: ss.retentionSec } : {}),
+      ...(ss.egressAllow ? { egressAllow: ss.egressAllow } : {}),
+      ...(ss.egressDeny ? { egressDeny: ss.egressDeny } : {}),
+      ...(ss.defaultTimeoutSec ? { defaultTimeoutSec: ss.defaultTimeoutSec } : {}),
+      advisoryLock,
+      extraTools: deploymentLayer.advertisedTools,
+      credentialPaths: deploymentLayer.credentialPaths,
+      layerToolFiles: () => deploymentLayer.installFiles,
+      blobTransfer,
+      ...(config.signingSecret ? { signingSecret: config.signingSecret } : {}),
+      ...(config.capabilitySecret ? { capabilitySecret: config.capabilitySecret } : {}),
+      ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
+      store: superserveBodies,
+      onError: sandboxOnError,
+    });
+  };
   const buildAws = (): Sandbox => {
     if (!config.awsSandbox.s3Bucket) throw new Error("SANDBOX_BACKEND=aws requires AWS_SANDBOX_S3_BUCKET");
     return createAwsSandbox(workspace, {
@@ -961,6 +1023,7 @@ export function buildApp(
     aws: buildAws,
     porter: buildPorter,
     agent37: buildAgent37,
+    superserve: buildSuperserve,
   };
   const enabledBackends = new Set(enabledSandboxBackends(config));
   const sandboxBackends: Partial<Record<SandboxBackendName, Sandbox>> = {
@@ -978,11 +1041,21 @@ export function buildApp(
     rollout: artifactMap<SandboxResourceRollout>("sandbox_resource_rollout"),
     legacyScopes: async () => (await sessions.distinctScopes()).map((scope) => scope.scopeId),
     legacySandboxes: async () => {
-      const [e2b, modal, aws] = await Promise.all([e2bBodies.entries(), modalBodies.entries(), awsBodies.entries()]);
+      const [e2b, modal, aws, superserve] = await Promise.all([
+        e2bBodies.entries(),
+        modalBodies.entries(),
+        awsBodies.entries(),
+        superserveBodies.entries(),
+      ]);
       return [
         ...e2b.map(([scopeId, body]) => ({ scopeId, backend: "e2b" as const, machineId: body.sandboxId })),
         ...modal.map(([scopeId, body]) => ({ scopeId, backend: "modal" as const, machineId: body.sandboxId })),
         ...aws.map(([scopeId, body]) => ({ scopeId, backend: "aws" as const, machineId: body.microvmId })),
+        ...superserve.map(([scopeId, body]) => ({
+          scopeId,
+          backend: "superserve" as const,
+          machineId: body.sandboxId,
+        })),
       ];
     },
     records: artifactMap<SandboxResource>("sandbox_resources"),
@@ -1384,6 +1457,10 @@ export function buildApp(
           },
         })
       : undefined;
+  const productAnalytics = createProductAnalytics(config.orgId, config.productAnalytics);
+  runs.onTerminal((run) => {
+    void productAnalytics.responseFinished(run);
+  });
   const ledger = runStore.ledger;
 
   let processes: ProcessRegistry | undefined;
@@ -1534,7 +1611,7 @@ export function buildApp(
   const deployGitSecret = config.signingSecret;
   const deployGitBase = config.apiBaseUrl;
   const deployService = createDeployService({
-    appPublished: createProductAnalytics(config.orgId, config.productAnalytics).appPublished,
+    appPublished: productAnalytics.appPublished,
     deployStore,
     provider: deployProvider,
     deployDir: join(config.dataDir, "deployments"),
@@ -2105,6 +2182,9 @@ export function buildApp(
             identity,
             run: (req) => app.turn(req),
             directory,
+            currentScopeMembers,
+            sessions,
+            getCron: (id) => crons.get(id),
             getAsk: (id) => keychain.getAsk(id),
             getGrant: (id) => keychain.getGrant(id),
           },

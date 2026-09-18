@@ -1,5 +1,6 @@
+import type { DocumentInput } from "../core/document-inputs.ts";
 import type { RuntimeControl, RuntimeHandoff } from "./runtime-types.ts";
-import type { AttachmentMeta, ConversationTurn, ScopeId, Session, SessionEntry } from "../types.ts";
+import type { AttachmentMeta, ConversationTurn, ScopeId, Session, SessionEntry, TurnRequest } from "../types.ts";
 import type { HarnessId } from "../model/pi-models.ts";
 import type {
   GapPhases,
@@ -29,9 +30,27 @@ interface HarnessImage {
   artifactId?: string;
 }
 
-export function envelopeWithoutMessages(payload: unknown): unknown {
+export function promptEnvelopeWithoutHistory(payload: unknown): unknown {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
-  return Object.fromEntries(Object.entries(payload as Record<string, unknown>).filter(([k]) => k !== "messages"));
+  const envelope: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(payload)) {
+    if (key === "contents") continue;
+    if (key === "messages" || key === "input") {
+      if (Array.isArray(value)) {
+        const instructions = value.filter(
+          (item: unknown) =>
+            item !== null &&
+            typeof item === "object" &&
+            "role" in item &&
+            (item.role === "system" || item.role === "developer"),
+        );
+        if (instructions.length) envelope[key] = instructions;
+      }
+    } else {
+      envelope[key] = key === "context" ? promptEnvelopeWithoutHistory(value) : value;
+    }
+  }
+  return envelope;
 }
 
 export interface HarnessLlmRequestRecord {
@@ -82,6 +101,11 @@ export interface HarnessTurnInput {
   overheard?: OverheardEntryPayload[];
   attachments?: AttachmentMeta[];
   images?: HarnessImage[];
+  prepareSteer?(
+    text: string,
+    request?: TurnRequest,
+  ): Promise<{ text: string; attachments?: AttachmentMeta[]; images?: HarnessImage[]; documents?: DocumentInput[] }>;
+  documents?: DocumentInput[];
   runtime?: Partial<RuntimeChoice>;
   runtimeControl?: RuntimeControl;
   runtimeActorId?: string;

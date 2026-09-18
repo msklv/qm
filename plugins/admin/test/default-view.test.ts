@@ -52,8 +52,8 @@ test("admin shell groups control, logs, and artifacts like the reorganization", 
   const actual = JSON.parse(JSON.stringify(vm.runInNewContext(sections)));
   assert.deepEqual(actual, [
     { views: ["governance", "models", "credentials", "connectors", "customize", "users"] },
-    { label: "Logs", views: ["history", "slack", "judgments", "errors", "audit", "egress", "metrics"] },
-    { label: "Artifacts", views: ["files", "skills", "memory", "deployments", "crons", "retention"] },
+    { label: "Logs", views: ["history", "slack", "judgments", "errors", "audit", "egress"] },
+    { label: "Artifacts", views: ["files", "skills", "memory", "deployments", "crons"] },
     { views: ["design-system"] },
   ]);
   assert.match(html, /history: "Sessions"/);
@@ -487,7 +487,7 @@ test("admin parity views expose the requested card groups and real navigation ac
   assert.match(html, /id="model-custom-provider-rows"/);
   assert.match(html, /provider\.models\.length/);
   assert.match(html, /function renderBuiltInConnectors\(\)/);
-  assert.match(html, /function loadPersonalKeychainSummary\(\)/);
+  assert.match(html, /function loadPersonalKeychainSummary\(requestId, requestedScope\)/);
   assert.doesNotMatch(html, /Enabled harnesses/);
   assert.doesNotMatch(html, /id="card-browsing"/);
   assert.doesNotMatch(html, /\$\("feature-flag-enable"\)\.disabled = true/);

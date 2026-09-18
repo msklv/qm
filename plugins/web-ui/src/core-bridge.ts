@@ -1,4 +1,5 @@
-import { captureMessage } from "./product-analytics.ts";
+import { stopBrowserErrors } from "./browser-errors.ts";
+import { captureMessage, stopAnalytics } from "./product-analytics.ts";
 import { streamedAnswer } from "./timeline.ts";
 import { EventType } from "@tanstack/ai/client";
 import { fetchServerSentEvents, StreamProcessor } from "@tanstack/ai-client";
@@ -675,6 +676,8 @@ export function reportSigninRequired(detail: SigninRequired): void {
 export async function webFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const response = await fetch(input, init);
   if (response.status !== 401) return response;
+  stopBrowserErrors();
+  stopAnalytics();
   let body: unknown;
   try {
     body = await response.clone().json();
@@ -811,6 +814,7 @@ export async function signalLiveRun(
   kind: "abort" | "steer",
   text: string | undefined,
   context: SteerContext,
+  queuedRunId?: string,
 ): Promise<SignalOutcome> {
   const run = slot.runId !== null ? { runId: slot.runId } : null;
   if (!run) throw new Error("No active run to signal.");
@@ -826,7 +830,12 @@ export async function signalLiveRun(
     await api(runPath(run.runId, "/signal"), {
       method: "POST",
       signal: kind === "abort" ? AbortSignal.timeout(RUN_REQUEST_TIMEOUT_MS) : undefined,
-      body: JSON.stringify({ kind, ...(text !== undefined ? { text } : {}), ...steerContext }),
+      body: JSON.stringify({
+        kind,
+        ...(text !== undefined ? { text } : {}),
+        ...steerContext,
+        ...(queuedRunId ? { queuedRunId } : {}),
+      }),
     });
     return { ok: true };
   } catch (err) {
@@ -843,52 +852,6 @@ export async function signalLiveRun(
     }
     throw err;
   }
-}
-
-const STEER_VERIFY_DELAYS_MS = [1200, 2200, 3600];
-const STEER_VERIFY_SKEW_MS = 120_000;
-
-export async function latestTranscriptSeq(sessionId: string): Promise<number | undefined> {
-  const page = await fetchTranscript(sessionId, { tailTurns: 1 });
-  const seqs = (page.entries ?? []).flatMap((e) => (e.seq === undefined ? [] : [e.seq]));
-  return seqs.length ? Math.max(...seqs) : undefined;
-}
-
-function steerTextMatches(stored: string, wanted: string): boolean {
-  return stored === wanted || stored.endsWith(`: ${wanted}`);
-}
-
-export async function verifySteerDelivered(
-  sessionId: string | null,
-  text: string,
-  sentAt: number,
-  delays: readonly number[] = STEER_VERIFY_DELAYS_MS,
-  sinceSeq?: number,
-): Promise<boolean> {
-  if (!sessionId) return false;
-  const wanted = text.trim();
-  if (!wanted) return false;
-  for (const delay of delays) {
-    await sleep(delay);
-    try {
-      const page = await fetchTranscript(sessionId, { tailTurns: 3 });
-      const found = (page.entries ?? []).some((e) => {
-        if (e.type !== "user") return false;
-        if (sinceSeq !== undefined && !(e.seq !== undefined && e.seq > sinceSeq)) return false;
-        const p = e.payload as { text?: string; steered?: boolean } | null;
-        return (
-          p?.steered === true &&
-          typeof p.text === "string" &&
-          steerTextMatches(p.text.trim(), wanted) &&
-          e.createdAt >= sentAt - STEER_VERIFY_SKEW_MS
-        );
-      });
-      if (found) return true;
-    } catch (e) {
-      swallow("web-ui: verify steer delivery", e);
-    }
-  }
-  return false;
 }
 
 export function makeCoreStreamFn(

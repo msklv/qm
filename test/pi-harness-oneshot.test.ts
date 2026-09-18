@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readdirSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
+import { zstdDecompressSync } from "node:zlib";
 import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
 import {
   buildDetectionPrompt,
@@ -290,6 +291,66 @@ test("Pi title generation rejects a reply-shaped answer with the rule that fired
     rule: "reply_opener",
     message: 'reply_opener: "Sorry, I can\'t summarize that"',
   });
+});
+
+test("Pi title generation accepts the prompted NONE sentinel without reporting a failure", async (t) => {
+  const server = createServer((request, response) => {
+    request.resume();
+    request.on("end", () => {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      for (const event of [
+        {
+          type: "message_start",
+          message: {
+            id: "msg_title",
+            type: "message",
+            role: "assistant",
+            model: "title-model",
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: 1, output_tokens: 0 },
+          },
+        },
+        { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+        { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: " NONE\n" } },
+        { type: "content_block_stop", index: 0 },
+        {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn", stop_sequence: null },
+          usage: { output_tokens: 1 },
+        },
+        { type: "message_stop" },
+      ]) {
+        response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+      }
+      response.end();
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
+  );
+  const address = server.address();
+  assert(address && typeof address !== "string");
+  const harness = createPiHarness({
+    defaultModelId: "claude-opus-4-8",
+    titleModelId: "claude-haiku-4-5",
+    modelGateway: {
+      url: `http://127.0.0.1:${address.port}`,
+      apiKey: "gateway-key",
+      apiKeyHeader: "api-key",
+      models: { "claude-haiku-4-5": "title-model" },
+    },
+  });
+
+  assert.equal(await harness.models.generateTitle!("User:\nHello"), undefined);
 });
 
 test("piHarnessConfigOptions omits the optional fields when the config leaves them unset", () => {
@@ -876,4 +937,26 @@ test("resolveConfiguredModelId: an unresolvable default is rejected too, so auxi
   assert.doesNotThrow(() =>
     getRequiredModel(auxiliaryModelFor(resolveConfiguredModelId(undefined, "anthropic/claude-sonnet-4-5"))),
   );
+});
+
+test("Pi judge uses supported reasoning effort when configured with Astra", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  let request: { model?: string; reasoning?: { effort?: string } } | undefined;
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const encoded = new Headers(init?.headers).get("content-encoding") === "zstd";
+    const text = encoded ? zstdDecompressSync(init?.body as Uint8Array).toString() : String(init?.body);
+    request = JSON.parse(text);
+    return new Response(JSON.stringify({ error: { message: "offline judge test" } }), { status: 400 });
+  }) as typeof fetch;
+  const harness = createPiHarness({
+    judgeModelId: "gpt-6-astra",
+    resolveProviderKeys: async () => ({ openai: "sk-offline-test-key" }),
+  });
+  await assert.rejects(harness.models.judge!("Judge the answer.", "answer"), /offline judge test/);
+  assert.ok(request);
+  assert.equal(request.model, "gpt-6-astra");
+  assert.equal(request.reasoning?.effort, "low");
 });
