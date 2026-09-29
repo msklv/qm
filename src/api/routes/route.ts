@@ -33,16 +33,10 @@ export type RouteAuth = "either" | "source" | "public" | { aud: string };
 export type Route<C extends BaseCtx = ApiCtx> = {
   handle: (ctx: C) => void | Promise<void>;
   auth: RouteAuth;
+  maxBodyBytes?: number;
 } & ({ method: string; path: string } | { match: (method: string, pathname: string) => boolean });
 
 export async function run<C extends BaseCtx>(route: Route<C>, params: Record<string, string>, ctx: C): Promise<void> {
   ctx.params = params;
   await route.handle(ctx);
-}
-
-export async function dispatch<C extends BaseCtx>(routes: ReadonlyArray<Route<C>>, ctx: C): Promise<boolean> {
-  const found = findRoute(routes, ctx.method, ctx.pathname);
-  if (!found) return false;
-  await run(found.route, found.params, ctx);
-  return true;
 }

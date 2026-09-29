@@ -1352,7 +1352,7 @@ test("AWS up reapplies the recorded layer after starting a stopped core", async 
   }
 });
 
-test("AWS up records a restore point under the lease before any mutation and stamps it in the manifest", async () => {
+test("AWS up records a restore point before mutation during storage optimization", async () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-aws-db-restore-point-"));
   const dockerBin = join(dir, "docker");
   writeFileSync(dockerBin, `#!/usr/bin/env node\nconsole.log("Digest: sha256:${"a".repeat(64)}");\n`);
@@ -1361,6 +1361,8 @@ test("AWS up records a restore point under the lease before any mutation and sta
   const fake = statefulAws(dir, single);
   const priorPath = process.env.PATH;
   process.env.PATH = `${dir}:${priorPath}`;
+  const priorStatus = process.env.AWS_FAKE_DB_STATUS;
+  process.env.AWS_FAKE_DB_STATUS = "storage-optimization";
   const started = Date.now();
   try {
     await awsUp(single, dir, { dryRun: true });
@@ -1395,6 +1397,8 @@ test("AWS up records a restore point under the lease before any mutation and sta
       "the manifest records the pre-deploy restore timestamp",
     );
   } finally {
+    if (priorStatus === undefined) delete process.env.AWS_FAKE_DB_STATUS;
+    else process.env.AWS_FAKE_DB_STATUS = priorStatus;
     process.env.PATH = priorPath;
     fake.restore();
     rmSync(dir, { recursive: true, force: true });
@@ -1413,7 +1417,7 @@ test("AWS up refuses to mutate when the database is unavailable, keeps no automa
       () => awsUp(single, dir, { yes: true }),
       /database acme-qm-core is backing-up; refusing to deploy/,
     );
-    delete process.env.AWS_FAKE_DB_STATUS;
+    process.env.AWS_FAKE_DB_STATUS = "storage-optimization";
     process.env.AWS_FAKE_DB_RETENTION = "0";
     await assert.rejects(
       () => awsUp(single, dir, { yes: true }),
@@ -2712,7 +2716,10 @@ test("AWS optional-secret activation restores prior tasks when a later service r
     "web-ui": state.services["acme-web-ui"].taskDefinition,
   };
   const arns = Object.fromEntries(
-    required.map((secret) => [secret.name, "arn:aws:secretsmanager:us-west-2:123456789012:secret:test-AbCdEf"]),
+    [...required.map((secret) => secret.name), "INBOX_USERS"].map((name) => [
+      name,
+      "arn:aws:secretsmanager:us-west-2:123456789012:secret:test-AbCdEf",
+    ]),
   );
   for (const workload of ["core", "web-ui"] as const) {
     const repository = secretsConfig.aws!.services[workload]!.ecrRepository;
@@ -6037,8 +6044,20 @@ test("controlled AWS cohorts bind immutable identities and hand over without ECS
     await assert.rejects(awsSetBackgroundWork(single, dir, false), /different deployment/);
     assert.equal(mutations.length, beforeWrongPause);
     ownership.desiredDeploymentId = manifest.backgroundDeploymentId;
-    await awsSetBackgroundWork(single, dir, false);
-    await awsSetBackgroundWork(single, dir, true);
+    const beforeCompensation = mutations.length;
+    for (const expected of [
+      { generation: ownership.generation - 1, lastRequestId: ownership.lastRequestId },
+      { generation: ownership.generation, lastRequestId: "different-request" },
+    ]) {
+      await assert.rejects(awsSetBackgroundWork(single, dir, false, undefined, expected), /changed since promotion/);
+    }
+    assert.equal(mutations.length, beforeCompensation);
+    await awsSetBackgroundWork(single, dir, false, undefined, {
+      generation: ownership.generation,
+      lastRequestId: ownership.lastRequestId,
+    });
+    const confirmed = await awsSetBackgroundWork(single, dir, true);
+    assert.equal(confirmed?.generation, 3);
     assert.equal(ownership.generation, 3);
     assert.equal(mutations.length, 4);
     assert.doesNotMatch(readFileSync(fake.log, "utf8"), /ecs update-service|register-task-definition|run-task/);

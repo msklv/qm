@@ -1,6 +1,12 @@
+import type { ExternalSlackPolicies } from "../resolution/external-slack.ts";
+import type { ProviderKeys } from "../harness/pi-harness.ts";
+import type { ModelGatewayTransportConfig } from "../model/provider-endpoints.ts";
+import type { DurableMap } from "../persistence/durable-map.ts";
 import type { BackgroundOwnershipStore } from "../runs/background-ownership.ts";
+import type { LoopIngressService } from "../loops/ingress.ts";
 import type { createSuggestedActivityService } from "../suggestions/activities.ts";
 import type { ManagedSlack } from "../surfaces/slack-managed.ts";
+import type { InboxSourceRefresh } from "../loops/inbox-source-refresh.ts";
 import type { BrokerSessionStore } from "../auth/broker-sessions.ts";
 import type { DirectFileUploads } from "../files/direct-file-upload.ts";
 import type { SandboxResources } from "../sandbox/sandbox-resources.ts";
@@ -42,6 +48,7 @@ import type { EnvironmentStore } from "../environments/environment-store.ts";
 import type { Scheduler } from "../cron/scheduler.ts";
 import type { WebhookReceiver } from "../webhooks/webhook-receiver.ts";
 import type { IdentityService } from "../identity/identity-service.ts";
+import type { PrincipalLinkService } from "../identity/principal-links.ts";
 import type { DeviceFlowCutoverStore } from "../credentials/device-flow-cutover.ts";
 import type { FeatureFlagStore } from "../feature-flags.ts";
 import type {
@@ -71,13 +78,22 @@ import type { RateLimiter } from "../ratelimit/rate-limiter.ts";
 import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { SlackInstallationStore, SlackSocketAppIdReader } from "../surfaces/slack-installation.ts";
 
+import type { SlackAccountLink, ComposioReturn } from "./routes/composio.ts";
+
 export interface ServerDeps {
+  externalSlackPolicies?: ExternalSlackPolicies;
+  checkReadiness?: (signal: AbortSignal) => Promise<void>;
+  browserModelGateway?: ModelGatewayTransportConfig;
+  resolveBrowserCompanyKeys?: (includeSubscription?: boolean) => Promise<ProviderKeys>;
+  slackAccounts?: DurableMap<SlackAccountLink>;
+  composioReturns?: DurableMap<ComposioReturn>;
   composioFetch?: typeof fetch;
   suggestedActivities?: ReturnType<typeof createSuggestedActivityService>;
   production?: boolean;
   allowUnauthenticatedCore?: boolean;
   signingSecret?: string;
   capabilitySecret?: string;
+  capabilityTokenCompression?: boolean;
   portalIdentitySecret?: string;
   requireSignedPortalIdentity?: boolean;
   control: ControlService;
@@ -129,6 +145,7 @@ export interface ServerDeps {
   inviteMailer?: InviteMailer;
   emailAuthPrincipals?: readonly string[];
   emailAuthDomain?: string;
+  slackAllowFrom?: readonly string[];
   rateLimiter?: RateLimiter;
   sessions?: SessionStore;
   screenSecurity?: SecurityScreenProbe;
@@ -160,6 +177,7 @@ export interface ServerDeps {
   channelPolicy?: ChannelPolicyStore;
   uiState?: UiStateStore;
   loopSourceTokens?: ConnectorTokenSource;
+  inboxSourceRefresh?: InboxSourceRefresh;
   loopSlackClient?: (token: string) => SlackUserClient;
   sessionShares?: SessionShareStore;
   sessionShareBytes?: DurableByteStore;
@@ -177,7 +195,9 @@ export interface ServerDeps {
   deployAppsLoginPath?: "/auth/login" | "/auth/trusted/login";
   scheduler?: Scheduler;
   webhookReceiver?: WebhookReceiver;
+  loopIngress?: LoopIngressService;
   identity?: IdentityService;
+  principalLinks?: PrincipalLinkService;
   keychain?: Keychain;
   serviceCreds?: ServiceCredentialStore;
   deliveries?: DeliveryStore;
