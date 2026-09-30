@@ -17,7 +17,14 @@ const USER = { "content-type": "application/json", "x-admin-actor": "bob@default
 
 afterEach(() => setCustomProviders([]));
 
-function start(modelCredentialFetch: typeof fetch = async () => new Response(null, { status: 200 })): {
+function start(
+  modelCredentialFetch: typeof fetch = async () => new Response(null, { status: 200 }),
+  providerKeys: { anthropic: boolean; openai: boolean; openrouter: boolean } = {
+    anthropic: true,
+    openai: false,
+    openrouter: false,
+  },
+): {
   base: string;
   built: BuiltApp;
   close: () => Promise<void>;
@@ -32,7 +39,7 @@ function start(modelCredentialFetch: typeof fetch = async () => new Response(nul
     refreshCustomProviders: built.refreshCustomProviders,
     modelCredentialFetch,
     harnessId: "pi",
-    providerKeys: { anthropic: true, openai: false, openrouter: false },
+    providerKeys,
     admin: built.admin,
     auditLog: built.auditLog,
   });
@@ -143,6 +150,60 @@ test("bad specs are refused with a reason", async () => {
     });
     assert.equal(reserved.status, 400);
     assert.match(((await reserved.json()) as { message: string }).message, /reserved/);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("a keyed custom provider appears as configured in the admin model-provider list", async () => {
+  const srv = start(undefined, { anthropic: false, openai: false, openrouter: false });
+  try {
+    await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({ ...BODY, validate: false }),
+    });
+    const res = await fetch(`${srv.base}/v1/admin/model-providers`, { headers: ADMIN });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as {
+      providers: { provider: string; configured: boolean; source: string }[];
+    };
+    const custom = body.providers.find((p) => p.provider === "acme-gateway");
+    assert.ok(custom, "custom provider must appear in the admin model-provider list");
+    assert.equal(custom.configured, true);
+    assert.equal(custom.source, "admin");
+  } finally {
+    await srv.close();
+  }
+});
+
+test("a keyless custom provider appears as not configured and a keyed one satisfies the surface gate", async () => {
+  const srv = start(undefined, { anthropic: false, openai: false, openrouter: false });
+  try {
+    await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({ ...BODY, apiKey: undefined, validate: false }),
+    });
+    const noKey = await fetch(`${srv.base}/v1/admin/model-providers`, { headers: ADMIN });
+    const noKeyBody = (await noKey.json()) as {
+      providers: { provider: string; configured: boolean; source: string }[];
+    };
+    const keyless = noKeyBody.providers.find((p) => p.provider === "acme-gateway");
+    assert.ok(keyless);
+    assert.equal(keyless.configured, false);
+    assert.equal(keyless.source, "absent");
+
+    const gateBefore = await fetch(`${srv.base}/v1/surface-config`);
+    assert.equal(((await gateBefore.json()) as { modelProviderConfigured?: boolean }).modelProviderConfigured, false);
+
+    await fetch(`${srv.base}/v1/admin/custom-providers/acme-gateway`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({ ...BODY, validate: false }),
+    });
+    const gateAfter = await fetch(`${srv.base}/v1/surface-config`);
+    assert.equal(((await gateAfter.json()) as { modelProviderConfigured?: boolean }).modelProviderConfigured, true);
   } finally {
     await srv.close();
   }

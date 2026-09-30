@@ -61,10 +61,26 @@ export async function getModelProviders(ctx: ApiCtx): Promise<void> {
   });
   const cached =
     ctx.url.searchParams.get("catalog") === "cached" ? cachedModelCatalog(ctx.deps.modelCredentialFetch) : undefined;
-  const [providers, models] = await Promise.all([
+  type ProviderStatusWithCustom = {
+    provider: string;
+    configured: boolean;
+    source: "admin" | "environment" | "absent";
+  };
+  const [builtIn, models, custom] = await Promise.all([
     ctx.deps.modelCredentials.statuses(),
     cached?.models ?? selectableModelCatalog(ctx.deps.modelCredentialFetch),
+    ctx.deps.customProviders ? ctx.deps.customProviders.statuses() : [],
   ]);
+  const providers: ProviderStatusWithCustom[] = [
+    ...builtIn,
+    ...custom
+      .filter((status) => !status.disabled)
+      .map((status) => ({
+        provider: status.id,
+        configured: status.hasKey,
+        source: (status.hasKey ? "admin" : "absent") as "admin" | "absent",
+      })),
+  ];
   return sendJson(ctx.res, 200, {
     providers,
     models,

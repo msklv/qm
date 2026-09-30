@@ -191,6 +191,9 @@ Keep deployment data separate from core code, but change core wherever your desi
 behavior requires it.
 
 From the source checkout, install dependencies with `npm ci` and use the in-tree CLI.
+
+To point QM at your own model gateway from within a deployment directory, see
+[Custom model providers](./docs/custom-model-providers.md).
 After completing the provider setup in [`deployment.md`](./deployment.md), build and
 deploy your modified services explicitly:
 

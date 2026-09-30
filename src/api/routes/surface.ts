@@ -1172,6 +1172,9 @@ async function getSurfaceConfig(ctx: ApiCtx): Promise<void> {
   const managedKeys = deps.modelCredentials ? await deps.modelCredentials.availability() : null;
   const configuredKeys = deps.providerKeys ?? managedKeys;
   const providerStatus = harnessId === "pi" && managedKeys ? managedKeys : configuredKeys;
+  const customKeyConfigured = deps.customProviders
+    ? (await deps.customProviders.statuses()).some((status) => !status.disabled && status.hasKey)
+    : false;
   const catalog = managedKeys?.openrouter
     ? await selectableModelCatalog(deps.modelCredentialFetch)
     : builtInModelCatalog();
@@ -1199,6 +1202,7 @@ async function getSurfaceConfig(ctx: ApiCtx): Promise<void> {
         providerStatus.openai ||
         providerStatus.openrouter ||
         providerStatus.modelIds?.size ||
+        customKeyConfigured ||
         deps.harnessCarriedModelAuth,
       ),
     }),
