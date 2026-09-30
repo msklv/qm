@@ -3847,7 +3847,7 @@ test("context recovery drains in-flight effects, preserves an active goal, and b
       },
     },
     scopeLabel: "personal:U1",
-    goal: createGoalRecord({ objective: "finish verification", source: "tool" }),
+    goal: createGoalRecord({ objective: "finish verification" }),
     emit: async (entry) => {
       events.push(entry as Emitted);
     },
@@ -3994,4 +3994,16 @@ test("thrown execution errors leave pending child messages for the next delivere
     assert.match(JSON.stringify(await call(tool, input)), /Important child finding/);
     assert.equal(pending, false);
   }
+});
+
+test("background process guidance reflects the configured sandbox token lifetime", () => {
+  const guidance = (opts?: { sandboxCapabilityTtlMs?: number }) =>
+    createAgentTools({ current: fakeToolContext() }, { sandboxResources: true, ...opts })
+      .map((tool) => tool.description)
+      .join("\n");
+  assert.match(guidance(), /turn tokens expire 48 hours/);
+  assert.match(guidance({ sandboxCapabilityTtlMs: 72 * 3_600_000 }), /turn tokens expire 72 hours/);
+  const unlimited = guidance({ sandboxCapabilityTtlMs: 0 });
+  assert.match(unlimited, /does not expire those turn tokens/);
+  assert.doesNotMatch(unlimited, /turn tokens expire \d+ hours/);
 });

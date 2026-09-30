@@ -97,6 +97,7 @@ import {
   makeOpenerStreamFn,
   makeRunResumeStreamFn,
   resolveApproval,
+  unresolvedApprovals,
   runApprovalTurn,
   type RunPoll,
   TAIL_TURNS,
@@ -186,7 +187,7 @@ import {
   watchActivityLabel,
 } from "./session-list";
 import { liveTurnThreadRef } from "./working-dot";
-import { goalElapsedLabel, goalObjectiveLabel, latestGoal } from "./goal-strip";
+import { goalElapsedLabel, goalObjectiveLabel, goalWorkedLabel, latestGoal } from "./goal-strip";
 import {
   ackKey,
   peekLines,
@@ -200,7 +201,7 @@ import { newChatDraftKey, saveDraft, storedDraft } from "./drafts";
 import { createForkOriginController, forkOriginView } from "./fork-origin";
 import { base64ToBytes } from "./paste-text";
 import { tip } from "./tooltip";
-import { workSeconds, workedLabel } from "./work-duration";
+import { goalWorked, workSeconds, workedLabel } from "./work-duration";
 import { decorateTextCodeBlocks } from "./text-code";
 
 import { createTranscriptViewport } from "./transcript-viewport";
@@ -771,7 +772,7 @@ export function createChatSurface(
     try {
       const threadRef = chatState.threadRef;
       const runId = await resolveApproval(decision);
-      if (chatState.normalStreamFn && chatState.onWork)
+      if (runId && chatState.normalStreamFn && chatState.onWork)
         await resumeRun(agent, threadRef, chatState.normalStreamFn, chatState.onWork, runId, undefined, () => {
           releaseSubmission();
           drawActiveChat(agent);
@@ -817,7 +818,7 @@ export function createChatSurface(
         if (!chatState.resolvingApprovals.has(approval.requestId)) byId.set(approval.requestId, approval);
       }
     }
-    return [...byId.values()];
+    return unresolvedApprovals([...byId.values()]);
   }
 
   function hasUnresolvedApproval(): boolean {
@@ -827,9 +828,7 @@ export function createChatSurface(
   async function syncPendingApprovals(agent: Agent, messages = agent.state.messages): Promise<void> {
     const id = chatState.sessionId;
     if (!id || agent !== chatState.agent) return;
-    const r = await api<{ approvals: PendingApproval[] }>(`/api/sessions/${encodeURIComponent(id)}/approvals`).catch(
-      () => null,
-    );
+    const r = await fetchSessionApprovals(id);
     if (!r || id !== chatState.sessionId || agent !== chatState.agent) return;
     for (const message of messages) delete (message as AssistantWork).work?.pendingApprovals;
     attachPendingApprovals(messages, r.approvals ?? [], transcriptModel());
@@ -1103,6 +1102,7 @@ export function createChatSurface(
     host.className = "custom-chat readonly-chat";
     let approvals: PendingApproval[] = [];
     const draw = () => {
+      approvals = unresolvedApprovals(approvals);
       const shownMessages = chatState.inheritedExpanded ? [...chatState.inheritedMessages, ...messages] : messages;
       prepareMessageRows(shownMessages);
       render(
@@ -1355,11 +1355,11 @@ export function createChatSurface(
     if (chatState.agent) drawActiveChat(chatState.agent);
   }
 
-  function earlierNotice(agent: Agent): TemplateResult {
+  function earlierNotice(): TemplateResult {
     return html`<div class="earlier-messages">
       <button
         class="earlier-messages-btn"
-        ?disabled=${chatState.loadingEarlier || agent.state.isStreaming}
+        ?disabled=${chatState.loadingEarlier}
         @click=${() => void loadEarlierMessages()}
       >
         ${chatState.loadingEarlier ? "Loading earlier messages…" : "Show earlier messages"}
@@ -1371,12 +1371,14 @@ export function createChatSurface(
     const agent = chatState.agent;
     const sessionId = chatState.sessionId;
     const anchor = chatState.transcriptAnchorSeq;
-    if (!agent || !sessionId || anchor === null || chatState.loadingEarlier || agent.state.isStreaming) return;
+    if (!agent || !sessionId || anchor === null || chatState.loadingEarlier) return;
     chatState.loadingEarlier = true;
+    transcriptViewport.cancelFollow();
     drawActiveChat(agent);
     try {
       const page = await fetchTranscript(sessionId, { beforeSeq: anchor, tailTurns: TAIL_TURNS });
-      if (agent !== chatState.agent || agent.state.isStreaming) return;
+      if (agent !== chatState.agent || sessionId !== chatState.sessionId || anchor !== chatState.transcriptAnchorSeq)
+        return;
       const split = inheritedTranscript(chatState.forkSession ?? {}, page.entries ?? []);
       const earlierMessages = entriesToMessages(split.current, transcriptModel());
       if (!chatState.inheritedLoaded)
@@ -1395,7 +1397,8 @@ export function createChatSurface(
       drawActiveChat(agent);
       requestAnimationFrame(() => {
         const scrollerNow = chatState.host?.querySelector<HTMLElement>(".chat-scroll");
-        if (!scrollerNow) return;
+        if (agent !== chatState.agent || sessionId !== chatState.sessionId || scrollerNow !== scroller || !scrollerNow)
+          return;
         const prev = scrollerNow.style.scrollBehavior;
         scrollerNow.style.scrollBehavior = "auto";
         scrollerNow.scrollTop = priorTop + (scrollerNow.scrollHeight - priorHeight);
@@ -1404,9 +1407,9 @@ export function createChatSurface(
     } catch {
       void 0;
     } finally {
-      if (chatState.loadingEarlier) {
+      if (agent === chatState.agent && sessionId === chatState.sessionId && chatState.loadingEarlier) {
         chatState.loadingEarlier = false;
-        if (agent === chatState.agent) drawActiveChat(agent);
+        drawActiveChat(agent);
       }
     }
   }
@@ -1463,6 +1466,10 @@ export function createChatSurface(
   function drawActiveChat(agent = chatState.agent, opts: { forceScroll?: boolean } = {}): void {
     if (!agent || agent !== chatState.agent || !chatState.host || (!ctx.inbox && appState.currentView !== "chats"))
       return;
+    for (const message of agent.state.messages) {
+      const work = (message as AssistantWork).work;
+      if (work?.pendingApprovals) work.pendingApprovals = unresolvedApprovals(work.pendingApprovals);
+    }
     adoptActiveSessionFromList(agent);
     if (!ctx.visible()) {
       postCurrentPaneState();
@@ -1519,8 +1526,8 @@ export function createChatSurface(
     if (ctx.inbox) {
       content = assistantSidebar({
         context: ctx.inbox.context(),
-        messages: html`${pinnedStrip()} ${inheritedHeader()}
-        ${chatState.earlierCount > 0 ? earlierNotice(agent) : nothing} ${messageContent}
+        messages: html`${pinnedStrip()} ${inheritedHeader()} ${chatState.earlierCount > 0 ? earlierNotice() : nothing}
+        ${messageContent}
         ${showStateError(messages, agent.state.errorMessage) ? html`<div class="composer-error inline">${agent.state.errorMessage}</div>` : nothing}`,
         status: liveWorkStatus(agent),
         busy: agent.state.isStreaming,
@@ -1563,7 +1570,7 @@ export function createChatSurface(
             ${pinnedStrip()}
             <div class="message-stack ${emptyChat ? "empty-stack" : ""}">
               ${showWelcome ? welcomeGreeting(!messages.length) : nothing} ${inheritedHeader()}
-              ${chatState.earlierCount > 0 ? earlierNotice(agent) : nothing} ${messageContent}
+              ${chatState.earlierCount > 0 ? earlierNotice() : nothing} ${messageContent}
               ${glanceTier ? nothing : liveWorkStatus(agent)}
               ${emptyChat && !isNewUser && !editingApp && !showWelcome ? html`<h1 class="chat-cta">${chatCta()}</h1>` : nothing}
               ${ctx.pane ? suggestions : nothing}
@@ -1834,7 +1841,9 @@ export function createChatSurface(
         data-index=${index}
         data-entry-seqs=${messageEntrySeqs(message).join(" ")}
       >
-        <div class="system-note">${label}: <code>${decision.command}</code></div>
+        <div class="system-note approval-decision">
+          ${label}<code class="approval-cmd approval-cmd-full">${decision.command}</code>
+        </div>
       </article>`;
     }
     if (role === "system-note") {
@@ -2155,7 +2164,8 @@ export function createChatSurface(
     const goalTicking = Boolean(
       chatState.agent?.state.isStreaming && latestGoal(visibleMessages(chatState.agent))?.status === "active",
     );
-    const active = (chatState.liveWork?.status === "working" && !chatState.liveWork.stale) || goalTicking;
+    const active =
+      (chatState.liveWork?.status === "working" && !chatState.liveWork.stale) || goalTicking || subagentUi.ticking;
     if (active && !workTicker) {
       workTicker = setInterval(() => drawActiveChat(), 1000);
     } else if (!active && workTicker) {
@@ -2440,6 +2450,7 @@ export function createChatSurface(
     expanded: false,
     peekId: null as string | null,
     peek: null as PeekLine[] | null,
+    ticking: false,
     timer: null as ReturnType<typeof setInterval> | null,
     approvals: new Map<string, PendingApproval[]>(),
     approvalsKey: "",
@@ -2537,6 +2548,7 @@ export function createChatSurface(
     const now = Date.now();
     const elapsed = goalElapsedLabel(row.startedAt, row.endedAt ?? now);
     const peeking = subagentUi.peekId === row.session.id;
+    const approvals = unresolvedApprovals(subagentUi.approvals.get(row.session.id) ?? []);
     const title = row.session.title?.trim() || "Subagent";
     return html`<div
       class="subagent-row ${row.state} ${peeking ? "peeking" : ""}"
@@ -2565,8 +2577,8 @@ export function createChatSurface(
         Open
       </button>
       ${
-        subagentUi.approvals.get(row.session.id)?.length
-          ? ctx.composer.composerApprovalPanel(subagentUi.approvals.get(row.session.id)!, (decision) =>
+        approvals.length
+          ? ctx.composer.composerApprovalPanel(approvals, (decision) =>
               resolveSubagentApproval(row.session.id, decision),
             )
           : nothing
@@ -2595,6 +2607,8 @@ export function createChatSurface(
     const rows = visibleSubagents(subagentRows(sessionsState.list, rootId), subagentUi.acknowledged);
     if (subagentUi.peekId && !rows.some((row) => row.session.id === subagentUi.peekId)) stopSubagentPeek();
     syncSubagentApprovals(rows);
+    subagentUi.ticking = rows.some((row) => row.state === "working" || row.state === "waiting");
+    syncWorkTicker();
     if (!rows.length) return nothing;
     const single = rows.length === 1;
     const expanded = single || subagentUi.expanded || rows.some((row) => row.state === "waiting");
@@ -2624,21 +2638,21 @@ export function createChatSurface(
   }
 
   function goalStrip(agent: Agent): TemplateResult | typeof nothing {
-    const goal = latestGoal(visibleMessages(agent));
-    if (!goal || (goal.status !== "active" && goal.status !== "paused")) return nothing;
-    const paused = goal.status === "paused";
-    const streaming = agent.state.isStreaming;
-    const elapsed = goalElapsedLabel(goal.createdAt, Date.now());
+    const messages = visibleMessages(agent);
+    const goal = latestGoal(messages);
+    if (!goal) return nothing;
+    const { workedMs, paused: stopped } = goalWorked(messages, goal);
+    const paused = goal.status === "paused" || (goal.status === "active" && stopped);
+    if (goal.status !== "active" && !paused) return nothing;
     let title = "Goal";
     if (paused) title = "Goal paused";
-    else if (streaming) title = "Pursuing goal";
+    else if (agent.state.isStreaming) title = "Pursuing goal";
     return html`
       <section class="goal-strip ${paused ? "paused" : ""}" aria-live="polite" title=${goal.objective}>
         <span class="goal-strip-icon">${icon(paused ? Pause : Target, 13)}</span>
         <span class="goal-strip-title">${title}</span>
         <span class="goal-strip-objective" dir="auto">${goalObjectiveLabel(goal.objective)}</span>
-        ${goal.floor ? html`<span class="goal-strip-meta">at least ${goal.floor}</span>` : nothing}
-        ${paused ? nothing : html`<span class="goal-strip-meta">· ${elapsed}</span>`}
+        <span class="goal-strip-meta">${goalWorkedLabel(workedMs, goal.floor)}</span>
       </section>
     `;
   }

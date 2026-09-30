@@ -324,6 +324,7 @@ export interface AgentToolsOptions {
   execTimeoutCeilingMs?: number;
   backgroundJobTtlMs?: number;
   backgroundJobTtlMaxMs?: number;
+  sandboxCapabilityTtlMs?: number;
   mcpTools?: () => McpToolDescriptor[];
   controlTools?: boolean;
   sandboxResources?: boolean;
@@ -351,6 +352,7 @@ export function coreToolOptions(config: Config): CoreToolOptions {
     execTimeoutCeilingMs: config.execTimeoutMaxMs,
     backgroundJobTtlMs: config.backgroundJobTtlMs,
     backgroundJobTtlMaxMs: config.backgroundJobTtlMaxMs,
+    sandboxCapabilityTtlMs: config.sandboxCapabilityTtlMs,
   };
 }
 
@@ -406,7 +408,12 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
   const bgTtlMaxSec = Math.round((opts?.backgroundJobTtlMaxMs ?? CONFIG_DEFAULTS.backgroundJobTtlMaxSec * 1000) / 1000);
   const bgTtlMin = Math.round(bgTtlSec / 60);
   const bgTtlMaxMin = Math.round(bgTtlMaxSec / 60);
-  const capabilityTtlHours = Math.round(SANDBOX_CAPABILITY_TTL_MS / 3_600_000);
+  const capabilityTtlMs = opts?.sandboxCapabilityTtlMs ?? SANDBOX_CAPABILITY_TTL_MS;
+  const capabilityTtlHours = capabilityTtlMs / 3_600_000;
+  const capabilityExpiry =
+    capabilityTtlMs === 0
+      ? "Two limits: this deployment does not expire those turn tokens, but authorization checks still apply (publish checkpoints to durable Files and retain the file ID for the later turn or cron)"
+      : `Two limits: those turn tokens expire ${capabilityTtlHours} hours after the turn that launched the job started (past that they 401 — publish checkpoints to durable Files and verify success before expiry, retaining the file ID for the later turn or cron; if publication is unavailable, report it and retain needed local state on a scoped computer)`;
   const log = async (type: EntryType, payload: unknown, sourceScopeId?: ScopeId | null): Promise<void> => {
     if (!ref.emit || !ref.scopeLabel) return;
     const scopeLabel = classifyScopeLabel({
@@ -1708,7 +1715,7 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
       "it's stopped automatically (a watch survives just long enough to tell you) — for anything " +
       `that finishes within ${execCeilingSec}s, just use \`execute\`. Available on the default sandbox or an authorized explicit sandbox_id; ` +
       "elsewhere, use `execute`. A background job carries the same environment a foreground `execute` " +
-      `does — $AGENT_API_URL, $AGENT_API_TOKEN and $AGENT_CREDENTIAL_TOKEN all work, so self-API calls and shared-credential broker calls run fine from background work. Two limits: those turn tokens expire ${capabilityTtlHours} hours after the turn that launched the job started (past that they 401 — publish checkpoints to durable Files and verify success before expiry, retaining the file ID for the later turn or cron; if publication is unavailable, report it and retain needed local state on a scoped computer), and a background job cannot deliver a file itself, so write results to ordinary workspace paths and attach them from a live turn after polling.\n` +
+      `does — $AGENT_API_URL, $AGENT_API_TOKEN and $AGENT_CREDENTIAL_TOKEN all work, so self-API calls and shared-credential broker calls run fine from background work. ${capabilityExpiry}, and a background job cannot deliver a file itself, so write results to ordinary workspace paths and attach them from a live turn after polling.\n` +
       "INTERACTIVE LOGINS: device-flow logins (`gh auth login`, " +
       "`glab auth login`, `gcloud auth login`, and anything that prints a verification URL/code then " +
       "blocks waiting on a human) belong here, NOT in `execute`. Run them with action=start, read the " +
@@ -2242,7 +2249,9 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
       "{everyMs} is ONLY for genuine sub-day polling where wall-clock time does not matter (first run one " +
       "interval from now, not immediately; an everyMs of 24h+ is rejected — use {cron,timezone} instead), or " +
       '{firstFireAt} (epoch ms; fires once then auto-cancels — use Date.now() for "send now").\n' +
-      "DELIVERY: by default a cron posts back to this conversation. To deliver elsewhere, set `recipient` " +
+      "DELIVERY: by default a cron posts back to this conversation — the surface where you are talking now (a web session, Slack DM, or thread). " +
+      "Keep that default for watches and follow-ups on work started here (including delegated sessions) unless the person names another destination; don't pick a DM just because it is a DM. " +
+      "To deliver elsewhere, set `recipient` " +
       "(a teammate's name → a DM; core resolves the name and the result echoes who it matched), `channel` " +
       "(a channel name → that channel), `participants` (a list of member ids → a group DM, which has no name; " +
       "you're added automatically; the group must already exist — post to it once with the slack tool's " +
@@ -3739,9 +3748,9 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
     name: "finish_silently",
     label: "finish_silently",
     description:
-      "End this turn immediately with no closing reply. Use on surface turns after posting or when " +
-      "choosing not to reply, and on scheduled background fires with nothing worth reporting. " +
-      "Keeps the audit log and any messages already posted. Do not write a closing status line. " +
+      "Ends this turn silently. Use on surface turns when choosing not to reply at all, and on " +
+      "scheduled background fires with nothing worth reporting. After posting a reply, just stop; " +
+      "this is not needed. Keeps the audit log and any messages already posted. " +
       "On a direct human turn without surface tools this does nothing — just answer.",
     parameters: Type.Object({
       reason: Type.Optional(
@@ -3832,13 +3841,39 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
     },
   });
 
+  const GOAL_EVIDENCE_FILES = 5;
+  const GOAL_EVIDENCE_FILE_CHARS = 20_000;
+  async function goalEvidenceFiles(
+    tc: typeof ref.current,
+    paths: readonly string[] | undefined,
+    signal?: AbortSignal,
+  ): Promise<string[]> {
+    const out: string[] = [];
+    for (const path of (paths ?? []).slice(0, GOAL_EVIDENCE_FILES)) {
+      const content = tc
+        ? await tc.read(path, signal).then(
+            (r) => r.content,
+            () => null,
+          )
+        : null;
+      let body = content ?? "[missing: no such file]";
+      if (body.length > GOAL_EVIDENCE_FILE_CHARS)
+        body = `${body.slice(0, GOAL_EVIDENCE_FILE_CHARS)}\n[truncated at ${GOAL_EVIDENCE_FILE_CHARS} of ${body.length} chars]`;
+      out.push(`<file path="${path.replace(/"/g, "")}">\n${body}\n</file>`);
+    }
+    return out;
+  }
+
   const createGoal = defineTool({
     name: "create",
     label: "create",
     description:
-      "Register a goal for this session — ONLY when the user explicitly asks for sustained, self-directed work " +
-      '("grind on X for 30 minutes", "keep going until the tests are green", "work through this list"); never infer ' +
-      "one from an ordinary request. Once registered the harness enforces it: trying to end a reply while the goal " +
+      "Register a goal for this session when the user explicitly asks for sustained, self-directed work " +
+      '("grind on X for 30 minutes", "do 20 minutes of research", "keep going until the tests are green"); never infer ' +
+      "one from an ordinary request. A request that names a duration or amount of work IS such a request: create the goal " +
+      "FIRST, before doing any of the work, with the floor set to exactly the amount the user named (20 minutes = " +
+      "minMs 1200000; never subtract time already spent). Do this even when the task looks hard, slow or impossible: " +
+      "the user asked for the effort, so create the goal and spend it rather than explaining why you will stop. Once registered the harness enforces it: trying to end a reply while the goal " +
       "is active (or while a work floor is unmet) is answered with a keep-going prompt, not a hard stop. Only the user can stop it; " +
       'when the work is verifiably done, request completion (goal action update "complete"); a fresh verifier decides. ' +
       "Fails if an unfinished goal exists.",
@@ -3882,7 +3917,6 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
           objective: p.objective,
           ...(p.floor ? { floor: p.floor } : {}),
           ...(p.token_cap !== undefined ? { capTokens: p.token_cap } : {}),
-          source: "tool",
         });
       } catch (e) {
         return recordCoreAuthoredResult(
@@ -3926,7 +3960,8 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
     description:
       'Request completion of the goal. Set to "complete" only when the objective has actually been achieved and no ' +
       "required work remains. Do not mark a goal complete merely because its budget is nearly exhausted or because " +
-      "you are stopping work. An independent fresh-context verifier reads only the objective and your note and " +
+      "you are stopping work. An independent fresh-context verifier reads only the objective, your note, and any " +
+      "workspace files you name in `files` (the harness reads them for it — name deliverables, never paste them into the note), and " +
       "decides; if it rejects, the goal stays active and its reasons come back to you. You cannot block, pause, or " +
       "resume a goal; only the user stops it.",
     parameters: Type.Object({
@@ -3934,9 +3969,15 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
       note: Type.String({
         description: "The concrete evidence (commands, output, results, links) that proves the objective is achieved.",
       }),
+      files: Type.Optional(
+        Type.Array(Type.String(), {
+          maxItems: GOAL_EVIDENCE_FILES,
+          description: "Workspace paths of the deliverables; the verifier reads them directly.",
+        }),
+      ),
     }),
     async execute(callId, params) {
-      const p = params as { note: string };
+      const p = params as { note: string; files?: string[] };
       await recordCall(callId, {
         tool: "goal",
         action: "update",
@@ -3952,8 +3993,21 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
           true,
         );
       }
+      if (goal.floor) {
+        const state = grindState(goal.floor, goalFloorMeter(goal, ref.goalMeter ?? createGrindMeter()));
+        if (!state.met)
+          return recordCoreAuthoredResult(
+            callId,
+            { tool: "goal", action: "update", error: "floor_unmet", goal },
+            text(
+              `The work floor is not met yet (${state.text}); the goal stays active and cannot be completed before then. Keep working: verify the result more deeply, harden it, or go further on the objective.`,
+            ),
+            true,
+          );
+      }
+      const evidence = [p.note ?? "", ...(await goalEvidenceFiles(ref.current, p.files, ref.abortSignal))].join("\n");
       const verdict = ref.verifyGoal
-        ? await ref.verifyGoal(goal.objective, p.note ?? "").catch((e: unknown) => ({
+        ? await ref.verifyGoal(goal.objective, evidence).catch((e: unknown) => ({
             complete: false,
             reasons: `the verifier failed (${errMessage(e)}); request completion again`,
           }))
@@ -3969,25 +4023,13 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
         );
       }
       delete goal.verifierFeedback;
-      let floorNote = "";
-      if (goal.floor) {
-        const meter = ref.goalMeter;
-        if (meter) {
-          const { grindState } = await import("./grind.ts");
-          const state = grindState(goal.floor, goalFloorMeter(goal, meter));
-          if (!state.met)
-            floorNote = ` The work floor is not met yet (${state.text}); expect keep-going prompts until it is — spend them on adjacent, genuinely useful work.`;
-        }
-      }
       goal.status = "complete";
       goal.updatedAt = Date.now();
       goal.completionNote = p.note;
       return recordCoreAuthoredResult(
         callId,
         { tool: "goal", action: "update", goal },
-        text(
-          `The verifier accepted completion; the goal is complete. Report the outcome (and evidence) to the user.${floorNote}`,
-        ),
+        text(`The verifier accepted completion; the goal is complete. Report the outcome (and evidence) to the user.`),
       );
     },
   });
@@ -4120,14 +4162,7 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
     async execute(callId, params) {
       const request = params as RuntimeRequest;
       await recordCall(callId, { tool: "runtime", ...request });
-      if (
-        request.action !== "get" &&
-        ref.goal &&
-        (ref.goal.status === "active" ||
-          ref.goal.status === "paused" ||
-          (ref.goal.floor &&
-            !grindState(ref.goal.floor, goalFloorMeter(ref.goal, ref.goalMeter ?? createGrindMeter())).met))
-      ) {
+      if (request.action !== "get" && ref.goal && (ref.goal.status === "active" || ref.goal.status === "paused")) {
         return recordCoreAuthoredResult(
           callId,
           { tool: "runtime", error: "goal_in_progress" },

@@ -1,7 +1,7 @@
 import type { SlackSessionStatusState } from "./slack/session-status.ts";
 import { availableRuntimeError } from "./api/runtime-config.ts";
 import { createApprovalStore } from "./core/approval-store.ts";
-import { createKeychainApprovals } from "./credentials/keychain-approval.ts";
+import { createKeychainApprovals, type KeychainApprovals } from "./credentials/keychain-approval.ts";
 import { asObject } from "./harness/codex-auth-file.ts";
 import { flushErrorReporting, startTiming } from "../plugins/chassis/src/error-reporting.ts";
 import type { TimingStatus } from "../plugins/chassis/src/timing.ts";
@@ -527,6 +527,7 @@ export interface BuiltApp {
   keychain?: Keychain;
   serviceCreds: ServiceCredentialStore;
   deliveries: DeliveryStore;
+  keychainApprovals?: KeychainApprovals;
   fireAskResolution?: (ask: KeychainAsk, grant?: KeychainGrant) => Promise<unknown>;
   fireDropResolution?: (drop: DropResolution) => Promise<unknown>;
   workspace: WorkspaceStore;
@@ -1369,6 +1370,7 @@ export function buildApp(
         ...piHarnessConfigOptions(config),
         modelGateway: gatewayTransport,
         resolveBaseModelId: () => orgBaseModelId() ?? defaultForHarness("pi"),
+        resolveFallbackRuntime: () => configStore.getPurposeRuntime("fallback"),
         resolveProviderKeys: resolveModelProviderKeys,
         signals: runSignals,
         mcpTools,
@@ -1953,6 +1955,7 @@ export function buildApp(
     ...(securityScreener ? { securityScreener } : {}),
     backgroundJobTtlMs: config.backgroundJobTtlMs,
     backgroundJobTtlMaxMs: config.backgroundJobTtlMaxMs,
+    sandboxCapabilityTtlMs: config.sandboxCapabilityTtlMs,
     ...(config.signingSecret ? { signingSecret: config.signingSecret } : {}),
     ...(config.capabilitySecret ? { capabilitySecret: config.capabilitySecret } : {}),
     capabilityTokenCompression: config.capabilityTokenCompression,
@@ -1997,6 +2000,7 @@ export function buildApp(
     ...(config.scratchExecEnabled ? { scratchExec: true } : {}),
     directory,
     isCurrentSharedScopeMember,
+    currentScopeMembers: createCurrentScopeMembers({ managedGroups: projects, directory, identity }, true),
     managedGroups: projects,
     ...(config.reachExecEnabled ? { reachExec: true } : {}),
     ...(config.surfaceDebugFooter ? { surfaceDebugFooter: true } : {}),
@@ -2196,21 +2200,21 @@ export function buildApp(
     items: loopItems,
     requestFire: (loopId) => void loopFire.fire(loopId, `loop:${loopId}:slack-event:${Date.now()}`).catch(() => {}),
   });
+  const keychainApprovals = keychain
+    ? createKeychainApprovals({
+        keychain,
+        app,
+        identity,
+        sessions,
+        audit: auditLog,
+        deliveries,
+        resume: (ask, grant) => askResolution!(ask, grant),
+      })
+    : undefined;
   const slackCore = createSlackCoreClient({
     identity,
     memory,
-    ...(keychain
-      ? {
-          keychainApprovals: createKeychainApprovals({
-            keychain,
-            app,
-            identity,
-            sessions,
-            audit: auditLog,
-            resume: (ask, grant) => askResolution!(ask, grant),
-          }),
-        }
-      : {}),
+    ...(keychainApprovals ? { keychainApprovals } : {}),
     surfaceCache,
     taskAcknowledgements: artifactMap<TaskAckState>("slack_task_acknowledgements"),
     sessionStatus: artifactMap<SlackSessionStatusState>("slack_session_status"),
@@ -2854,6 +2858,7 @@ export function buildApp(
     ...(keychain ? { keychain } : {}),
     serviceCreds: credentialStore,
     deliveries,
+    ...(keychainApprovals ? { keychainApprovals } : {}),
     ...(askResolution ? { fireAskResolution: askResolution } : {}),
     ...(dropResolution ? { fireDropResolution: dropResolution } : {}),
     sandbox,
@@ -2994,6 +2999,7 @@ export function serverDeps(
     ...(built.keychain ? { keychain: built.keychain } : {}),
     serviceCreds: built.serviceCreds,
     deliveries: built.deliveries,
+    ...(built.keychainApprovals ? { keychainApprovals: built.keychainApprovals } : {}),
     ...(built.fireAskResolution ? { fireAskResolution: built.fireAskResolution } : {}),
     runs: built.runs,
     signals: built.signals,
