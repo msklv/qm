@@ -328,6 +328,7 @@ interface LocalSandboxEnv {
   memoryMb?: number;
   coreContainer?: string;
   defaultTimeoutSec?: number;
+  sharedNetworks?: string[];
 }
 
 function localSandboxEnv(env: NodeJS.ProcessEnv): LocalSandboxEnv {
@@ -343,6 +344,17 @@ function localSandboxEnv(env: NodeJS.ProcessEnv): LocalSandboxEnv {
       : {}),
     ...(numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) !== undefined
       ? { defaultTimeoutSec: numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) }
+      : {}),
+    ...(env.LOCAL_SANDBOX_SHARED_NETWORKS
+      ? {
+          sharedNetworks: [
+            ...new Set(
+              env.LOCAL_SANDBOX_SHARED_NETWORKS.split(",")
+                .map((n) => n.trim())
+                .filter(Boolean),
+            ),
+          ],
+        }
       : {}),
   };
 }

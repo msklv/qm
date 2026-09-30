@@ -439,6 +439,19 @@ test("QM_CORE_CONTAINER reaches the local sandbox, the containerized backend tha
   );
 });
 
+test("LOCAL_SANDBOX_SHARED_NETWORKS attaches the sandbox to shared docker networks", () => {
+  assert.equal(loadConfig({}).localSandbox.sharedNetworks, undefined);
+  assert.deepEqual(
+    loadConfig({
+      SANDBOX_BACKEND: "local",
+      LOCAL_SANDBOX_SHARED_NETWORKS: "agent-sandbox_layer, agent-sandbox_publish, agent-sandbox_layer",
+    }).localSandbox.sharedNetworks,
+    ["agent-sandbox_layer", "agent-sandbox_publish"],
+    "comma lists parse into trimmed, deduplicated network names",
+  );
+  assert.deepEqual(loadConfig({ LOCAL_SANDBOX_SHARED_NETWORKS: " ,, " }).localSandbox.sharedNetworks, []);
+});
+
 test("SANDBOX_BACKEND: unset defaults to local (dev only); the retired secondary variable is tolerated", () => {
   assert.equal(loadConfig({}).sandboxBackend, "local");
   assert.throws(

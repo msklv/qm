@@ -47,6 +47,7 @@ export interface LocalSandboxOptions {
   memoryMb?: number;
   coreContainer?: string;
   defaultTimeoutSec?: number;
+  sharedNetworks?: string[];
   homeDir?: string;
   repoRoot?: string;
   dockerExec?: DockerExec;
@@ -275,6 +276,7 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
       "agent_env=dev",
       "--network",
       net,
+      ...(opts.sharedNetworks ?? []).flatMap((n) => ["--network", n]),
       ...(withVolume && scope ? ["-v", `${localVolumeName(scope)}:${homeDir}`] : []),
       ...(opts.coreContainer ? [] : ["-p", `127.0.0.1:0:${AGENT_PORT}`]),
       "--add-host=host.docker.internal:host-gateway",
