@@ -430,6 +430,15 @@ test("SUPERSERVE_CONFIG_GENERATION accepts only nonnegative safe integers", () =
   }
 });
 
+test("QM_CORE_CONTAINER reaches the local sandbox, the containerized backend that dials docker by name", () => {
+  assert.equal(loadConfig({}).localSandbox.coreContainer, undefined);
+  assert.equal(
+    loadConfig({ SANDBOX_BACKEND: "local", QM_CORE_CONTAINER: "qm-acme-core" }).localSandbox.coreContainer,
+    "qm-acme-core",
+    "without the core container name core falls back to a host-random published port it cannot reach from inside its own container",
+  );
+});
+
 test("SANDBOX_BACKEND: unset defaults to local (dev only); the retired secondary variable is tolerated", () => {
   assert.equal(loadConfig({}).sandboxBackend, "local");
   assert.throws(
