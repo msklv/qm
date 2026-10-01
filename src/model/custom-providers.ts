@@ -24,6 +24,7 @@ interface CustomModelSpec {
   name?: string;
   contextWindow?: number;
   maxTokens?: number;
+  supportsImage?: boolean;
   /** USD per million input tokens. Defaults to 0 (unknown / not metered). */
   input?: number;
   /** USD per million output tokens. Defaults to 0. */
@@ -66,6 +67,8 @@ export function validateCustomProviderSpec(spec: CustomProviderSpec): void {
       throw new Error(`model id "${m.id}" is already registered`);
     if (seen.has(m.id)) throw new Error(`duplicate model id "${m.id}"`);
     seen.add(m.id);
+    if (m.supportsImage !== undefined && typeof m.supportsImage !== "boolean")
+      throw new Error(`model "${m.id}": supportsImage must be a boolean`);
     for (const [field, v] of [
       ["contextWindow", m.contextWindow],
       ["maxTokens", m.maxTokens],
@@ -120,7 +123,7 @@ function toRuntimeModel(provider: CustomProviderSpec, m: CustomModelSpec): Custo
     api: customProviderApi(provider.protocol),
     baseUrl: provider.baseUrl,
     reasoning: false,
-    input: ["text"],
+    input: m.supportsImage ? ["text", "image"] : ["text"],
     cost: { input: m.input ?? 0, output: m.output ?? 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: m.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
     maxTokens: m.maxTokens ?? DEFAULT_MAX_TOKENS,

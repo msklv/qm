@@ -11,7 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       bash coreutils findutils grep sed gawk \
       git curl wget jq unzip \
       nftables \
-      python3 python3-venv python3-pip \
+      python3 python3-venv python3-pip python3-pil \
+      tesseract-ocr tesseract-ocr-rus tesseract-ocr-eng \
       ca-certificates gnupg \
   && rm -rf /var/lib/apt/lists/*
 
@@ -49,7 +50,8 @@ RUN case "$TARGETARCH" in \
   && aws --version
 
 RUN python3 -m venv /opt/agent-venv \
-  && /opt/agent-venv/bin/pip install --no-cache-dir --upgrade pip
+  && /opt/agent-venv/bin/pip install --no-cache-dir --upgrade pip \
+  && /opt/agent-venv/bin/pip install --no-cache-dir pillow numpy pytesseract
 ENV PATH="/opt/agent-venv/bin:${PATH}"
 ENV VIRTUAL_ENV=/opt/agent-venv
 

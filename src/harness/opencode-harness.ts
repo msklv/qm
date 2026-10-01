@@ -715,6 +715,12 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
                   m.id,
                   {
                     name: m.name ?? m.id,
+                    ...(m.supportsImage
+                      ? {
+                          attachment: true,
+                          modalities: { input: ["text", "image"], output: ["text"] },
+                        }
+                      : {}),
                     ...(m.contextWindow || m.maxTokens
                       ? {
                           limit: {
